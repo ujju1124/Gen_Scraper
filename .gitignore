@@ -108,3 +108,14 @@ restart-docker-safe.ps1
 fix-docker-wsl.ps1
 stop-and-resume-guide.md
 overnight-running-guide.md
+
+# Reference code (not part of project)
+zubdata/
+
+# GitHub setup guides (temporary)
+GITHUB_SETUP_GUIDE.md
+GITHUB_PUSH_SUCCESS.md
+PUSH_NOW.md
+READY_TO_PUSH.md
+FINAL_PUSH_COMMAND.txt
+push-to-github.ps1
