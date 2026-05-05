@@ -1,0 +1,129 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - scraper_network
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - scraper_network
+
+  migrator:
+    build: ./backend
+    command: sh -c "alembic upgrade head && python seed.py"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
+    restart: "no"
+    networks:
+      - scraper_network
+
+  backend:
+    build: ./backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    dns:
+      - 100.127.255.165
+      - 100.127.255.73
+      - 8.8.8.8
+    networks:
+      - scraper_network
+
+  worker:
+    build: ./backend
+    command: celery -A tasks.scrape_task worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-1}
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    shm_size: "1gb"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    dns:
+      - 100.127.255.165
+      - 100.127.255.73
+      - 8.8.8.8
+    networks:
+      - scraper_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    environment:
+      # Environment variables for nginx runtime (if needed)
+      - NGINX_HOST=localhost
+      - NGINX_PORT=80
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - scraper_network
+
+volumes:
+  postgres_data:
+
+networks:
+  scraper_network:
+    driver: bridge

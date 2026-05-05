@@ -1,0 +1,110 @@
+# Environment Variables (CRITICAL - Contains secrets!)
+.env
+backend/.env
+*.env.local
+*.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+backend/.coverage
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.kiro/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Alembic
+alembic/versions/__pycache__/
+backend/alembic/versions/__pycache__/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+backend/debug/*.html
+backend/debug/*.png
+
+# Docker volumes and data
+postgres_data/
+redis_data/
+
+# Playwright/Browser automation
+.playwright-mcp/
+*.html
+*.png
+admin_*.png
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Large analysis files
+analyze_*.py
+add_*.sql
+
+# Documentation (keep organized docs, ignore temp files)
+*_COMPLETE.md
+RECOVERY_STATUS.md
+PROGRESS_UPDATE.md
+
+# Scripts (keep main scripts, ignore temp ones)
+stop-scraping.ps1
+resume-scraping.ps1
+pre-sleep-checklist.ps1
+restart-docker-safe.ps1
+fix-docker-wsl.ps1
+stop-and-resume-guide.md
+overnight-running-guide.md
