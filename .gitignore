@@ -97,8 +97,35 @@ add_*.sql
 
 # Documentation (keep organized docs, ignore temp files)
 *_COMPLETE.md
+*_RESULTS.md
+*_ANALYSIS.md
+*_DIAGNOSIS.md
+*_STATUS.md
+*_FINDINGS.md
+*_SUMMARY.md
+*_FIX.md
+*_ISSUE*.md
+*_BUG*.md
+*_TEST*.md
+*_CRASH*.md
 RECOVERY_STATUS.md
 PROGRESS_UPDATE.md
+STEP*.md
+PHASE*.md
+MERGE_*.md
+CRITICAL_*.md
+VERIFICATION_*.md
+DOCKER_*.md
+INSPECTOR_*.md
+SCALE_*.md
+FINAL_*.md
+PRE_*.md
+DEPLOYMENT_*.md
+BROWSER_*.md
+DETAIL_*.md
+SELF_*.md
+FRESH_*.md
+BOOKING_COM_*.md
 
 # Scripts (keep main scripts, ignore temp ones)
 stop-scraping.ps1
@@ -108,6 +135,9 @@ restart-docker-safe.ps1
 fix-docker-wsl.ps1
 stop-and-resume-guide.md
 overnight-running-guide.md
+docker-crashed-recovery.ps1
+test_*.py
+check_*.py
 
 # Reference code (not part of project)
 zubdata/

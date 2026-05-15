@@ -3,9 +3,13 @@ BookingComScraper - Booking.com Scraper Implementation
 
 This module implements the scraper for Booking.com hotel listings.
 It extracts hotel data using data-testid selectors and JSON-LD structured data.
+Supports detail page scraping for enriched data (amenities, reviews, check-in times).
 """
 
+import json
+import random
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import quote_plus
@@ -13,6 +17,7 @@ from urllib.parse import quote_plus
 import structlog
 from sqlalchemy.orm import Session
 
+from config import settings
 from models.source import Source
 from scrapers.base_scraper import BaseScraper
 
@@ -62,30 +67,75 @@ class BookingComScraper(BaseScraper):
                 max_results=max_results
             )
             
-            # Navigate to search results
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+            # Navigate to search results with timeout
+            try:
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                logger.error(
+                    "scraper.navigation_failed",
+                    source_name=self.source_name,
+                    url=search_url,
+                    error=str(e)
+                )
+                return []
             
             # Handle cookie consent banner if present
-            try:
-                # Booking.com uses OneTrust consent - accept all cookies
-                consent_button = await page.wait_for_selector(
-                    'button[id="onetrust-accept-btn-handler"]',
-                    timeout=5000
-                )
-                if consent_button:
-                    await consent_button.click()
-                    logger.info(
-                        "scraper.cookie_consent_accepted",
-                        source_name=self.source_name
-                    )
-                    # Wait for page to reload after consent
-                    await page.wait_for_timeout(3000)
-            except Exception:
-                # No consent banner - proceed normally
-                pass
+            # Try multiple consent button selectors (different regions use different buttons)
+            consent_selectors = [
+                'button[id="onetrust-accept-btn-handler"]',
+                'button[id="didomi-notice-agree-button"]',
+                'button:has-text("Accept")',
+                'button:has-text("I agree")',
+                'button:has-text("Accept all")',
+            ]
             
-            # Now wait for property cards
-            await page.wait_for_selector('[data-testid="property-card"]', timeout=15000)
+            consent_clicked = False
+            for selector in consent_selectors:
+                try:
+                    btn = await page.wait_for_selector(selector, timeout=3000)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        # Wait for actual navigation to complete (not fixed timeout)
+                        await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                        # Small buffer after load
+                        await page.wait_for_timeout(2000)
+                        logger.info(
+                            "scraper.cookie_consent_accepted",
+                            source_name=self.source_name,
+                            selector=selector
+                        )
+                        consent_clicked = True
+                        break
+                except Exception:
+                    continue
+            
+            if not consent_clicked:
+                logger.info(
+                    "scraper.no_cookie_consent_banner",
+                    source_name=self.source_name
+                )
+            
+            # Now wait for property cards with timeout
+            try:
+                await page.wait_for_selector('[data-testid="property-card"]', timeout=15000)
+                cards = await page.query_selector_all('[data-testid="property-card"]')
+                logger.info(
+                    "scraper.cards_found",
+                    source_name=self.source_name,
+                    card_count=len(cards)
+                )
+            except Exception as e:
+                # Log current page state for debugging
+                title = await page.title()
+                url = page.url
+                logger.error(
+                    "scraper.cards_not_found",
+                    source_name=self.source_name,
+                    page_title=title,
+                    page_url=url,
+                    error=str(e)
+                )
+                return []
             
             # Check for CAPTCHA
             if await self._detect_captcha(page):
@@ -116,7 +166,7 @@ class BookingComScraper(BaseScraper):
             # Extract initial batch
             for idx, card in enumerate(property_cards):
                 try:
-                    hotel_data = await self._extract_hotel_data(card, source.id, location)
+                    hotel_data = await self._extract_hotel_data(card, page, source, db, location)
                     if hotel_data:
                         if json_ld_data and idx == 0:
                             hotel_data = {**hotel_data, **json_ld_data}
@@ -128,7 +178,7 @@ class BookingComScraper(BaseScraper):
                                 count=len(results),
                                 max_results=max_results
                             )
-                            return results[:max_results]
+                            break  # Break to allow detail extraction
                 except Exception as e:
                     logger.warning(
                         "scraper.card_extraction_failed",
@@ -150,8 +200,10 @@ class BookingComScraper(BaseScraper):
             #   3. Click button → wait for new cards → extract → repeat
             #   4. Stop when: limit reached OR no new cards after click/scroll
             load_more_clicks = 0
-            max_load_more = 20
+            max_load_more = 5  # Reduced from 20 to prevent hangs
             consecutive_no_change = 0
+            pagination_start_time = time.time()
+            max_pagination_time = 60  # Maximum 60 seconds for pagination
             
             logger.info(
                 "scraper.starting_pagination",
@@ -162,6 +214,16 @@ class BookingComScraper(BaseScraper):
             )
             
             while load_more_clicks < max_load_more:
+                # Check pagination timeout
+                if time.time() - pagination_start_time > max_pagination_time:
+                    logger.warning(
+                        "scraper.pagination_timeout",
+                        source_name=self.source_name,
+                        elapsed_seconds=int(time.time() - pagination_start_time),
+                        results_collected=len(results)
+                    )
+                    break
+                
                 # Check limit before doing any more work
                 if max_results and len(results) >= max_results:
                     logger.info(
@@ -193,7 +255,7 @@ class BookingComScraper(BaseScraper):
                         new_cards = all_cards_now[dom_cards_processed:]
                         for card in new_cards:
                             try:
-                                hotel_data = await self._extract_hotel_data(card, source.id, location)
+                                hotel_data = await self._extract_hotel_data(card, page, source, db, location)
                                 if hotel_data:
                                     results.append(hotel_data)
                                     if max_results and len(results) >= max_results:
@@ -203,7 +265,7 @@ class BookingComScraper(BaseScraper):
                                             count=len(results),
                                             max_results=max_results
                                         )
-                                        return results[:max_results]
+                                        break  # Break to allow detail extraction
                             except Exception as e:
                                 logger.warning(
                                     "scraper.card_extraction_failed",
@@ -286,7 +348,7 @@ class BookingComScraper(BaseScraper):
                     
                     for card in new_cards:
                         try:
-                            hotel_data = await self._extract_hotel_data(card, source.id, location)
+                            hotel_data = await self._extract_hotel_data(card, page, source, db, location)
                             if hotel_data:
                                 results.append(hotel_data)
                                 if max_results and len(results) >= max_results:
@@ -296,7 +358,7 @@ class BookingComScraper(BaseScraper):
                                         count=len(results),
                                         max_results=max_results
                                     )
-                                    return results[:max_results]
+                                    break  # Break to allow detail extraction
                         except Exception as e:
                             logger.warning(
                                 "scraper.card_extraction_failed",
@@ -322,6 +384,50 @@ class BookingComScraper(BaseScraper):
                 load_more_clicks=load_more_clicks,
                 result_count=len(results)
             )
+            
+            # DEBUG: Check if we reach detail extraction code
+            logger.info("DEBUG_DETAIL_REACHED", result_count=len(results))
+            
+            # DETAIL PAGE SCRAPING (following Google Maps pattern)
+            # Step 1: Collect detail page URLs from results
+            detail_urls = []
+            for result in results:
+                if 'source_url' in result and result['source_url']:
+                    detail_urls.append(result['source_url'])
+            
+            logger.info(
+                "scraper.detail_urls_collected",
+                source_name=self.source_name,
+                url_count=len(detail_urls),
+                result_count=len(results)
+            )
+            
+            # Step 2: Limit to max_detail_pages (default 10)
+            max_detail_pages = getattr(settings, 'MAX_DETAIL_PAGES_PER_JOB', 10)
+            if max_detail_pages and len(detail_urls) > max_detail_pages:
+                detail_urls = detail_urls[:max_detail_pages]
+                logger.info(
+                    "scraper.detail_urls_limited",
+                    source_name=self.source_name,
+                    total_urls=len(detail_urls),
+                    max_detail_pages=max_detail_pages
+                )
+            
+            # Step 3: Visit each detail page and extract enriched data
+            if detail_urls:
+                logger.info(
+                    "scraper.starting_detail_extraction",
+                    source_name=self.source_name,
+                    detail_page_count=len(detail_urls)
+                )
+                
+                await self._extract_from_detail_pages(
+                    page=page,
+                    source=source,
+                    db=db,
+                    results=results,
+                    detail_urls=detail_urls
+                )
             
         except Exception as e:
             logger.error(
@@ -380,118 +486,559 @@ class BookingComScraper(BaseScraper):
         
         return url
     
-    async def _extract_hotel_data(self, card, source_id: int, location: str) -> Optional[dict]:
+    async def _extract_hotel_data(self, card, page, source: Source, db: Session, location: str) -> Optional[dict]:
         """
         Extract hotel data from a property card element.
         
+        Uses direct data-testid selectors based on actual Booking.com page structure.
+        
         Args:
             card: Playwright element handle for property card
-            source_id: ID of the source
+            page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
             location: Location string for city fallback
             
         Returns:
             Dictionary of extracted hotel data, or None if extraction fails
         """
         data = {
-            "source_id": source_id,
+            "source_id": source.id,
             "currency": "NPR"  # Booking.com shows NPR for Nepal locations
         }
         
         try:
-            # Extract name
+            # Extract name using data-testid="title"
             name_elem = await card.query_selector('[data-testid="title"]')
             if name_elem:
-                data["name"] = (await name_elem.text_content()).strip()
+                name = await name_elem.inner_text()
+                if name:
+                    data["name"] = name.strip()
             
-            # Extract rating_overall and review_count
-            # Format: "Scored 9.7 9.7Exceptional 295 reviews"
+            if "name" not in data:
+                logger.warning(
+                    "scraper.critical_field_missing",
+                    field="name",
+                    source_id=source.id,
+                    message="Name extraction failed"
+                )
+                return None
+            
+            # Extract rating_overall using data-testid="review-score"
+            # Structure: <div data-testid="review-score"><div>Scored 9.2</div><div>9.2</div><div>Superb<br>43 reviews</div></div>
             rating_elem = await card.query_selector('[data-testid="review-score"]')
             if rating_elem:
-                rating_text = (await rating_elem.text_content()).strip()
-                
-                # Extract first number (rating)
-                rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                if rating_match:
-                    data["rating_overall"] = float(rating_match.group(1))
-                
-                # Extract review count (last number before "reviews")
-                review_match = re.search(r'(\d+)\s*reviews?', rating_text, re.IGNORECASE)
-                if review_match:
-                    data["review_count"] = int(review_match.group(1))
+                rating_text = await rating_elem.inner_text()
+                if rating_text:
+                    # Extract rating number (e.g., "9.2")
+                    rating_match = re.search(r'(\d+\.?\d*)', rating_text)
+                    if rating_match:
+                        data["rating_overall"] = float(rating_match.group(1))
+                    
+                    # Extract review count
+                    review_match = re.search(r'(\d+)\s*reviews?', rating_text, re.IGNORECASE)
+                    if review_match:
+                        data["review_count"] = int(review_match.group(1))
             
-            # Extract price_min
-            # Format: "NPR 3,334" or "NPR 3334"
-            price_elem = await card.query_selector('[data-testid="price-and-discounted-price"]')
+            # Extract price using data-testid="availability-rate-information"
+            price_elem = await card.query_selector('[data-testid="availability-rate-information"]')
             if price_elem:
-                price_text = (await price_elem.text_content()).strip()
-                
-                # Remove "NPR" and commas, extract number
-                price_clean = re.sub(r'[^\d.]', '', price_text)
-                if price_clean:
-                    try:
-                        data["price_min"] = float(price_clean)
-                    except ValueError:
-                        pass
+                price_text = await price_elem.inner_text()
+                if price_text:
+                    # Extract number from "NPR 3,334" or "NPR 3334" or "$150"
+                    price_clean = re.sub(r'[^\d.]', '', price_text)
+                    if price_clean:
+                        try:
+                            data["price_min"] = float(price_clean)
+                        except ValueError:
+                            pass
             
-            # Extract address
+            # Extract address using data-testid="address-link"
             address_elem = await card.query_selector('[data-testid="address-link"]')
             if address_elem:
-                data["address"] = (await address_elem.text_content()).strip()
+                address_text = await address_elem.inner_text()
+                if address_text:
+                    # Clean up address (may contain "Show on map" or similar)
+                    address = address_text.replace('· Show on map', '').replace('Show on map', '').strip()
+                    if address:
+                        data["address"] = address
+                        # Extract city (last part after comma)
+                        parts = address.split(',')
+                        if len(parts) >= 2:
+                            data["city"] = parts[-1].strip()
+                        else:
+                            data["city"] = address.strip()
             
-            # Extract city from address or use location as fallback
-            if "address" in data:
-                addr = data["address"]
-                # Booking.com address format: "Neighbourhood, City"
-                # or just "City"
-                parts = addr.split(",")
-                if len(parts) >= 2:
-                    data["city"] = parts[-1].strip()
-                else:
-                    data["city"] = addr.strip()
-            else:
-                data["city"] = location  # fallback to search location
+            # Fallback city to search location
+            if "city" not in data:
+                data["city"] = location
             
-            # Extract thumbnail_url (img src attribute)
-            thumbnail_elem = await card.query_selector('[data-testid="image"]')
-            if thumbnail_elem:
-                # Get img element inside
-                img = await thumbnail_elem.query_selector('img')
+            # Extract thumbnail_url from first image in card
+            img_elem = await card.query_selector('img')
+            if img_elem:
+                src = await img_elem.get_attribute('src')
+                if src:
+                    data["thumbnail_url"] = src
+            
+            # Extract star_rating using data-testid="rating-stars"
+            # Count SVG elements and divide by 2 (Booking.com uses 2 SVGs per star)
+            star_elem = await card.query_selector('[data-testid="rating-stars"]')
+            if star_elem:
+                svg_elements = await star_elem.query_selector_all('svg')
+                if svg_elements:
+                    star_count = len(svg_elements) // 2
+                    if star_count > 0:
+                        data["star_rating"] = star_count
+            
+            # Fallback: Try aria-label method
+            if "star_rating" not in data:
+                star_button = await card.query_selector('button[aria-label*="out of"]')
+                if star_button:
+                    aria_label = await star_button.get_attribute('aria-label')
+                    if aria_label:
+                        # Extract first number from "4 out of 5"
+                        star_match = re.search(r'(\d+)', aria_label)
+                        if star_match:
+                            try:
+                                data["star_rating"] = int(star_match.group(1))
+                            except ValueError:
+                                pass
+            
+            # Extract amenities - look for facility icons with text
+            # Pattern: <div><img/><div>Bar</div></div>
+            amenity_list = []
+            amenity_containers = await card.query_selector_all('[data-testid="property-card"] > div > div')
+            for container in amenity_containers:
+                # Check if container has an img and text
+                img = await container.query_selector('img')
                 if img:
-                    src = await img.get_attribute('src')
-                    if src:
-                        data["thumbnail_url"] = src
+                    text_elem = await container.query_selector('div')
+                    if text_elem:
+                        text = await text_elem.inner_text()
+                        if text and len(text) < 50:  # Reasonable amenity name length
+                            amenity_list.append(text.strip())
             
-            # Set star_rating to None (not reliable from Booking.com)
-            data["star_rating"] = None
+            if amenity_list:
+                data["amenities"] = ", ".join(amenity_list[:5])  # Limit to first 5
             
-            # Extract source_url (href of title-link)
-            link_elem = await card.query_selector('[data-testid="title-link"]')
-            if link_elem:
-                href = await link_elem.get_attribute('href')
+            # Extract source_url from title link
+            if name_elem:
+                href = await name_elem.get_attribute('href')
+                if not href:
+                    # Try parent link
+                    parent = await name_elem.evaluate_handle('el => el.closest("a")')
+                    if parent:
+                        href = await parent.get_attribute('href')
+                
                 if href:
-                    # Strip tracking parameters
+                    # Clean URL
                     href_clean = href.split('?')[0]
-                    
-                    # Make absolute URL if relative
                     if href_clean.startswith('/'):
                         data["source_url"] = f"https://www.booking.com{href_clean}"
                     else:
                         data["source_url"] = href_clean
             
-            # Only return if we have at least name
-            if "name" in data:
-                return data
-            else:
-                logger.warning(
-                    "scraper.card_missing_name",
-                    source_id=source_id
-                )
-                return None
+            return data
                 
         except Exception as e:
             logger.warning(
                 "scraper.card_extraction_error",
-                source_id=source_id,
+                source_id=source.id,
                 error=str(e)
             )
             return None
+    
+    async def _extract_from_detail_pages(
+        self,
+        page,
+        source: Source,
+        db: Session,
+        results: list[dict],
+        detail_urls: list[str]
+    ) -> None:
+        """
+        Visit each hotel detail page and extract enriched data.
+        Updates the results list in-place with additional fields.
+        
+        Following Google Maps pattern:
+        - Visit each detail URL with delays
+        - Extract additional fields (amenities, reviews, check-in times)
+        - Merge with existing card data by matching source_url
+        
+        Args:
+            page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
+            results: List of hotel dictionaries (modified in-place)
+            detail_urls: List of detail page URLs to visit
+        """
+        delay_min = getattr(settings, 'DETAIL_PAGE_DELAY_MIN', 3000)
+        delay_max = getattr(settings, 'DETAIL_PAGE_DELAY_MAX', 6000)
+        
+        for idx, url in enumerate(detail_urls):
+            try:
+                logger.info(
+                    "scraper.extracting_detail",
+                    source_name=self.source_name,
+                    index=idx + 1,
+                    total=len(detail_urls),
+                    url=url
+                )
+                
+                # Navigate to detail page with timeout and error handling
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as e:
+                    logger.warning(
+                        "scraper.detail_navigation_failed",
+                        source_name=self.source_name,
+                        url=url,
+                        error=str(e)
+                    )
+                    continue
+                
+                # Random delay between pages (3-6 seconds default)
+                delay = random.randint(delay_min, delay_max)
+                await page.wait_for_timeout(delay)
+                
+                # Check for CAPTCHA
+                if await self._detect_captcha(page):
+                    logger.warning(
+                        "scraper.captcha_detected_on_detail",
+                        source_name=self.source_name,
+                        results_processed=idx
+                    )
+                    # Stop detail extraction but keep card data
+                    break
+                
+                # Wait for main content
+                try:
+                    await page.wait_for_selector('[data-testid="property-section"]', timeout=10000)
+                except Exception:
+                    logger.warning(
+                        "scraper.detail_content_not_found",
+                        source_name=self.source_name,
+                        url=url
+                    )
+                    continue
+                
+                # Extract detail page data
+                detail_data = await self._extract_detail_page_data(page, source, db)
+                
+                if detail_data:
+                    # Find matching result by source_url and merge
+                    for result in results:
+                        if result.get('source_url') == url:
+                            result.update(detail_data)
+                            logger.debug(
+                                "scraper.detail_data_merged",
+                                source_name=self.source_name,
+                                name=result.get('name'),
+                                fields_added=list(detail_data.keys())
+                            )
+                            break
+                
+            except Exception as e:
+                logger.warning(
+                    "scraper.detail_extraction_error",
+                    source_name=self.source_name,
+                    url=url,
+                    error=str(e)
+                )
+                continue
+        
+        logger.info(
+            "scraper.detail_extraction_complete",
+            source_name=self.source_name,
+            pages_visited=len(detail_urls)
+        )
+    
+    async def _extract_detail_field(
+        self,
+        page,
+        source: Source,
+        db: Session,
+        field_name: str
+    ) -> Optional[str]:
+        """
+        Extract a field from detail page using DB selector.
+        
+        This is a simplified version of _extract_field_with_healing for detail pages.
+        Does NOT trigger healing (healing should only happen on card extraction).
+        
+        Args:
+            page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
+            field_name: Name of the field to extract
+            
+        Returns:
+            Extracted text value or None
+        """
+        selector_record = self.selectors.get(field_name)
+        if not selector_record:
+            return None
+        
+        try:
+            elem = await page.query_selector(selector_record.selector)
+            if elem:
+                text = await elem.text_content()
+                return text.strip() if text else None
+        except Exception as e:
+            logger.debug(
+                "selector.detail_field_error",
+                field=field_name,
+                error=str(e)
+            )
+        
+        return None
+    
+    async def _extract_detail_page_data(
+        self,
+        page,
+        source: Source,
+        db: Session
+    ) -> dict:
+        """
+        Extract enriched data from hotel detail page.
+        
+        Extracts:
+        - Full amenities list
+        - Review score breakdown (Staff, Location, etc.)
+        - Check-in/check-out times
+        - Languages spoken
+        - JSON-LD structured data (address, rating)
+        
+        Args:
+            page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
+            
+        Returns:
+            Dictionary of enriched hotel data
+        """
+        data = {}
+        
+        try:
+            # Extract amenities list
+            amenities = await self._extract_amenities(page, source, db)
+            if amenities:
+                data['amenities'] = amenities
+            
+            # Extract review scores breakdown
+            review_scores = await self._extract_review_scores(page, source, db)
+            if review_scores:
+                data['review_scores'] = review_scores
+            
+            # Extract check-in/check-out times
+            # The selector DIV.b99b6ef58f matches many elements, we need to find the right ones
+            # and parse the time from the text
+            checkin_raw = await self._extract_detail_field(page, source, db, 'detail_checkin')
+            if checkin_raw:
+                # Try to extract just the time range from the text
+                # Format: "From 12:00 PM to 11:00 PM" or full policy section
+                checkin_text = checkin_raw.strip()
+                
+                # If we got the full policy section, try to extract just the check-in time
+                if 'Check-in' in checkin_text and 'Check-out' in checkin_text:
+                    # Parse: "Check-inFrom 12:00 PM to 11:00 PMCheck-out..."
+                    match = re.search(r'Check-in\s*From\s+([\d:]+\s*[AP]M)\s+to\s+([\d:]+\s*[AP]M)', checkin_text)
+                    if match:
+                        data['checkin_time'] = f"From {match.group(1)} to {match.group(2)}"
+                elif checkin_text.startswith('From') and 'to' in checkin_text:
+                    # Already in correct format: "From 12:00 PM to 11:00 PM"
+                    data['checkin_time'] = checkin_text
+            
+            checkout_raw = await self._extract_detail_field(page, source, db, 'detail_checkout')
+            if checkout_raw:
+                # Try to extract just the time range from the text
+                # Format: "From 12:00 AM to 11:00 AM" or full policy section
+                checkout_text = checkout_raw.strip()
+                
+                # If we got the full policy section, try to extract just the check-out time
+                if 'Check-out' in checkout_text:
+                    # Parse: "...Check-outFrom 12:00 AM to 11:00 AM..."
+                    match = re.search(r'Check-out\s*From\s+([\d:]+\s*[AP]M)\s+to\s+([\d:]+\s*[AP]M)', checkout_text)
+                    if match:
+                        data['checkout_time'] = f"From {match.group(1)} to {match.group(2)}"
+                elif checkout_text.startswith('From') and 'to' in checkout_text:
+                    # Already in correct format: "From 12:00 AM to 11:00 AM"
+                    data['checkout_time'] = checkout_text
+            
+            # Extract languages (may not be available on all hotels)
+            languages = await self._extract_detail_field(page, source, db, 'detail_languages')
+            if languages:
+                # Only save if it looks like actual language names (not amenities)
+                lang_text = languages.strip()
+                # Check if it contains common language names
+                if any(lang in lang_text for lang in ['English', 'Hindi', 'Nepali', 'Chinese', 'Japanese', 'French', 'German', 'Spanish', 'Arabic', 'Korean']):
+                    data['languages'] = lang_text
+            
+            # Extract JSON-LD structured data
+            jsonld_data = await self._extract_jsonld_data(page)
+            if jsonld_data:
+                # Merge JSON-LD data (address, rating, reviews)
+                if 'address' in jsonld_data and 'streetAddress' in jsonld_data['address']:
+                    data['address_full'] = jsonld_data['address']['streetAddress']
+                
+                if 'aggregateRating' in jsonld_data:
+                    rating_data = jsonld_data['aggregateRating']
+                    if 'ratingValue' in rating_data:
+                        data['rating_jsonld'] = float(rating_data['ratingValue'])
+                    if 'reviewCount' in rating_data:
+                        data['review_count_jsonld'] = int(rating_data['reviewCount'])
+            
+            # Extract full description (longer than card description)
+            description = await self._extract_detail_field(page, source, db, 'detail_description')
+            if description:
+                data['description_full'] = description.strip()
+            
+            # Extract star rating from detail page
+            star_rating_text = await self._extract_detail_field(page, source, db, 'detail_star_rating')
+            if star_rating_text:
+                # Extract number from "4 out of 5 stars"
+                star_match = re.search(r'(\d+)', star_rating_text)
+                if star_match:
+                    try:
+                        data['star_rating_detail'] = int(star_match.group(1))
+                    except ValueError:
+                        pass
+            
+        except Exception as e:
+            logger.warning(
+                "scraper.detail_page_extraction_error",
+                source_name=self.source_name,
+                error=str(e)
+            )
+        
+        return data
+    
+    async def _extract_amenities(
+        self,
+        page,
+        source: Source,
+        db: Session
+    ) -> Optional[str]:
+        """
+        Extract amenities list from detail page.
+        
+        Returns comma-separated string of amenities.
+        """
+        try:
+            amenities_selector = self.selectors.get('detail_amenities')
+            if not amenities_selector:
+                return None
+            
+            amenities_elements = await page.query_selector_all(amenities_selector.selector)
+            if not amenities_elements:
+                return None
+            
+            amenities_list = []
+            for elem in amenities_elements[:20]:  # Limit to first 20 amenities
+                text = await elem.text_content()
+                if text:
+                    amenities_list.append(text.strip())
+            
+            if amenities_list:
+                return ', '.join(amenities_list)
+            
+        except Exception as e:
+            logger.debug(
+                "scraper.amenities_extraction_error",
+                source_name=self.source_name,
+                error=str(e)
+            )
+        
+        return None
+    
+    async def _extract_review_scores(
+        self,
+        page,
+        source: Source,
+        db: Session
+    ) -> Optional[dict]:
+        """
+        Extract review score breakdown (Staff, Location, Cleanliness, etc.).
+        
+        Returns dictionary like:
+        {
+            "Staff": 9.0,
+            "Location": 9.5,
+            "Cleanliness": 8.6,
+            ...
+        }
+        """
+        try:
+            # Find all review subscore containers
+            review_containers = await page.query_selector_all('[data-testid="review-subscore"]')
+            if not review_containers:
+                return None
+            
+            scores = {}
+            
+            for container in review_containers:
+                try:
+                    # Extract category name
+                    category_elem = await container.query_selector('.d96a4619c0')
+                    if not category_elem:
+                        continue
+                    category = await category_elem.text_content()
+                    category = category.strip() if category else None
+                    
+                    # Extract score value
+                    score_elem = await container.query_selector('.a9918d47bf.f87e152973')
+                    if not score_elem:
+                        continue
+                    score_text = await score_elem.text_content()
+                    score_text = score_text.strip() if score_text else None
+                    
+                    if category and score_text:
+                        try:
+                            score = float(score_text)
+                            scores[category] = score
+                        except ValueError:
+                            pass
+                
+                except Exception as e:
+                    logger.debug(
+                        "scraper.review_score_item_error",
+                        source_name=self.source_name,
+                        error=str(e)
+                    )
+                    continue
+            
+            return scores if scores else None
+            
+        except Exception as e:
+            logger.debug(
+                "scraper.review_scores_extraction_error",
+                source_name=self.source_name,
+                error=str(e)
+            )
+        
+        return None
+    
+    async def _extract_jsonld_data(self, page) -> Optional[dict]:
+        """
+        Extract JSON-LD structured data from detail page.
+        
+        Returns parsed JSON-LD object with address, rating, reviews.
+        """
+        try:
+            jsonld_text = await page.evaluate('''() => {
+                const script = document.querySelector('script[type="application/ld+json"]');
+                return script ? script.textContent : null;
+            }''')
+            
+            if jsonld_text:
+                jsonld_data = json.loads(jsonld_text)
+                return jsonld_data
+        
+        except Exception as e:
+            logger.debug(
+                "scraper.jsonld_extraction_error",
+                source_name=self.source_name,
+                error=str(e)
+            )
+        
+        return None
