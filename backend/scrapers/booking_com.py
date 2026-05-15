@@ -711,16 +711,18 @@ class BookingComScraper(BaseScraper):
                     # Stop detail extraction but keep card data
                     break
                 
-                # Wait for main content
+                # Wait for main content - use verified selector
                 try:
-                    await page.wait_for_selector('[data-testid="property-section"]', timeout=10000)
+                    await page.wait_for_selector('h2, [data-testid="property-header"], .pp-header__title', timeout=15000)
                 except Exception:
+                    # Page may have loaded without this selector
+                    # Continue anyway and try extraction
                     logger.warning(
-                        "scraper.detail_content_not_found",
+                        "scraper.detail_selector_timeout",
                         source_name=self.source_name,
                         url=url
                     )
-                    continue
+                    # Do NOT continue — still attempt extraction
                 
                 # Extract detail page data
                 detail_data = await self._extract_detail_page_data(page, source, db)
@@ -820,6 +822,93 @@ class BookingComScraper(BaseScraper):
         data = {}
         
         try:
+            # Extract from JSON-LD (most reliable for address, property_type, rating)
+            try:
+                json_ld_data = await page.evaluate('''() => {
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const s of scripts) {
+                        try {
+                            const d = JSON.parse(s.textContent);
+                            if (d["@type"] === "Hotel" || d["@type"] === "LodgingBusiness") {
+                                return {
+                                    address: d.address?.streetAddress,
+                                    property_type: d["@type"],
+                                    description: d.description,
+                                    image: d.image,
+                                    rating: d.aggregateRating?.ratingValue,
+                                    review_count: d.aggregateRating?.reviewCount
+                                };
+                            }
+                        } catch(e) {}
+                    }
+                    return null;
+                }''')
+                
+                if json_ld_data:
+                    if json_ld_data.get('address'):
+                        data['address'] = json_ld_data['address']
+                    if json_ld_data.get('property_type'):
+                        data['property_type'] = json_ld_data['property_type']
+                    if json_ld_data.get('description'):
+                        data['description_short'] = json_ld_data['description']
+                    if json_ld_data.get('rating'):
+                        data['rating_overall'] = float(json_ld_data['rating'])
+                    if json_ld_data.get('review_count'):
+                        data['review_count'] = int(json_ld_data['review_count'])
+                    
+                    logger.debug(
+                        "detail.jsonld_extracted",
+                        source_name=self.source_name,
+                        fields=list(json_ld_data.keys())
+                    )
+            except Exception as e:
+                logger.debug("detail.jsonld_failed", error=str(e))
+            
+            # Extract check-in/check-out times from House Rules section EARLY
+            # (before other extractions that might cause page navigation issues)
+            # Use the verified selector: [data-testid="property-section--content"]
+            # NOTE: This selector returns multiple elements, we need to find the right one
+            try:
+                house_rules_selector = self.selectors.get('detail_house_rules')
+                if house_rules_selector:
+                    # Get ALL elements matching the selector (not just the first one)
+                    elements = await page.query_selector_all(house_rules_selector.selector)
+                    logger.debug("detail.house_rules_elements", count=len(elements), source_name=self.source_name)
+                    
+                    # Loop through elements to find the one with check-in/out info
+                    for i, elem in enumerate(elements):
+                        text = await elem.text_content()
+                        if text and 'Check-in' in text and 'Check-out' in text:
+                            logger.debug("detail.house_rules_found", element_index=i, source_name=self.source_name)
+                            house_rules_text = text.strip()
+                            
+                            # Parse check-in time: "Check-inFrom 12:00 PM to 11:00 PM"
+                            checkin_match = re.search(
+                                r'Check-in\s*From\s+([\d:]+\s*[AP]M)\s+to\s+([\d:]+\s*[AP]M)', 
+                                house_rules_text, 
+                                re.IGNORECASE
+                            )
+                            if checkin_match:
+                                data['checkin_time'] = f"From {checkin_match.group(1)} to {checkin_match.group(2)}"
+                                logger.info("detail.checkin_extracted", time=data['checkin_time'], source_name=self.source_name)
+                            
+                            # Parse check-out time: "Check-outFrom 12:00 AM to 11:00 AM"
+                            checkout_match = re.search(
+                                r'Check-out\s*From\s+([\d:]+\s*[AP]M)\s+to\s+([\d:]+\s*[AP]M)', 
+                                house_rules_text, 
+                                re.IGNORECASE
+                            )
+                            if checkout_match:
+                                data['checkout_time'] = f"From {checkout_match.group(1)} to {checkout_match.group(2)}"
+                                logger.info("detail.checkout_extracted", time=data['checkout_time'], source_name=self.source_name)
+                            
+                            break  # Found it, stop looking
+                else:
+                    logger.warning("detail.house_rules_selector_missing", source_name=self.source_name)
+                    
+            except Exception as e:
+                logger.warning("detail.house_rules_failed", error=str(e), source_name=self.source_name)
+            
             # Extract amenities list
             amenities = await self._extract_amenities(page, source, db)
             if amenities:
@@ -829,50 +918,6 @@ class BookingComScraper(BaseScraper):
             review_scores = await self._extract_review_scores(page, source, db)
             if review_scores:
                 data['review_scores'] = review_scores
-            
-            # Extract check-in/check-out times
-            # The selector DIV.b99b6ef58f matches many elements, we need to find the right ones
-            # and parse the time from the text
-            checkin_raw = await self._extract_detail_field(page, source, db, 'detail_checkin')
-            if checkin_raw:
-                # Try to extract just the time range from the text
-                # Format: "From 12:00 PM to 11:00 PM" or full policy section
-                checkin_text = checkin_raw.strip()
-                
-                # If we got the full policy section, try to extract just the check-in time
-                if 'Check-in' in checkin_text and 'Check-out' in checkin_text:
-                    # Parse: "Check-inFrom 12:00 PM to 11:00 PMCheck-out..."
-                    match = re.search(r'Check-in\s*From\s+([\d:]+\s*[AP]M)\s+to\s+([\d:]+\s*[AP]M)', checkin_text)
-                    if match:
-                        data['checkin_time'] = f"From {match.group(1)} to {match.group(2)}"
-                elif checkin_text.startswith('From') and 'to' in checkin_text:
-                    # Already in correct format: "From 12:00 PM to 11:00 PM"
-                    data['checkin_time'] = checkin_text
-            
-            checkout_raw = await self._extract_detail_field(page, source, db, 'detail_checkout')
-            if checkout_raw:
-                # Try to extract just the time range from the text
-                # Format: "From 12:00 AM to 11:00 AM" or full policy section
-                checkout_text = checkout_raw.strip()
-                
-                # If we got the full policy section, try to extract just the check-out time
-                if 'Check-out' in checkout_text:
-                    # Parse: "...Check-outFrom 12:00 AM to 11:00 AM..."
-                    match = re.search(r'Check-out\s*From\s+([\d:]+\s*[AP]M)\s+to\s+([\d:]+\s*[AP]M)', checkout_text)
-                    if match:
-                        data['checkout_time'] = f"From {match.group(1)} to {match.group(2)}"
-                elif checkout_text.startswith('From') and 'to' in checkout_text:
-                    # Already in correct format: "From 12:00 AM to 11:00 AM"
-                    data['checkout_time'] = checkout_text
-            
-            # Extract languages (may not be available on all hotels)
-            languages = await self._extract_detail_field(page, source, db, 'detail_languages')
-            if languages:
-                # Only save if it looks like actual language names (not amenities)
-                lang_text = languages.strip()
-                # Check if it contains common language names
-                if any(lang in lang_text for lang in ['English', 'Hindi', 'Nepali', 'Chinese', 'Japanese', 'French', 'German', 'Spanish', 'Arabic', 'Korean']):
-                    data['languages'] = lang_text
             
             # Extract JSON-LD structured data
             jsonld_data = await self._extract_jsonld_data(page)
@@ -922,7 +967,9 @@ class BookingComScraper(BaseScraper):
         """
         Extract amenities list from detail page.
         
-        Returns comma-separated string of amenities.
+        Uses verified selector: [data-testid="property-most-popular-facilities-wrapper"] span
+        
+        Returns comma-separated string of unique amenities.
         """
         try:
             amenities_selector = self.selectors.get('detail_amenities')
@@ -934,13 +981,25 @@ class BookingComScraper(BaseScraper):
                 return None
             
             amenities_list = []
-            for elem in amenities_elements[:20]:  # Limit to first 20 amenities
+            for elem in amenities_elements:
                 text = await elem.text_content()
                 if text:
-                    amenities_list.append(text.strip())
+                    text_clean = text.strip()
+                    # Filter out empty strings and very long text (likely not amenities)
+                    if text_clean and len(text_clean) < 50:
+                        amenities_list.append(text_clean)
             
             if amenities_list:
-                return ', '.join(amenities_list)
+                # Remove duplicates while preserving order
+                unique_amenities = []
+                seen = set()
+                for amenity in amenities_list:
+                    if amenity not in seen:
+                        unique_amenities.append(amenity)
+                        seen.add(amenity)
+                
+                # Limit to first 20 unique amenities
+                return ', '.join(unique_amenities[:20])
             
         except Exception as e:
             logger.debug(
