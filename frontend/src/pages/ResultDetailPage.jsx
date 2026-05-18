@@ -16,6 +16,33 @@ export function ResultDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
+  // Category-specific field groups
+  const CATEGORY_FIELDS = {
+    hotels: ['name', 'brand', 'property_type', 'star_rating', 'address', 'street_address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'price_min', 'price_max', 'currency', 'includes_breakfast', 'rating_overall', 'review_count', 'rating_cleanliness', 'rating_location', 'rating_facilities', 'amenities', 'pets_allowed', 'checkin_time', 'checkout_time'],
+    restaurants: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'price_min', 'price_max', 'currency', 'rating_overall', 'review_count', 'cuisine_type', 'opening_hours', 'amenities'],
+    pharmacies: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'opening_hours', 'description_short'],
+    hospitals: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'description_short', 'amenities'],
+    banks: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'opening_hours'],
+    // default: show only non-null fields
+    default: null
+  }
+
+  // Helper to check if field should be displayed
+  const shouldDisplayField = (fieldName, categoryName) => {
+    if (!result) return false
+    
+    // Get category-specific fields or use default (all non-null)
+    const categoryFields = CATEGORY_FIELDS[categoryName?.toLowerCase()] || CATEGORY_FIELDS.default
+    
+    if (categoryFields === null) {
+      // Default: show only non-null fields
+      return result[fieldName] !== null && result[fieldName] !== undefined && result[fieldName] !== ''
+    }
+    
+    // Show field if it's in the category's field list
+    return categoryFields.includes(fieldName)
+  }
+
   useEffect(() => {
     const fetchResult = async () => {
       setLoading(true)
@@ -121,6 +148,9 @@ export function ResultDetailPage() {
   }
 
   const hasCoordinates = result.latitude && result.longitude
+  
+  // Get category name for field filtering
+  const categoryName = result.category_name || result.category || 'default'
 
   return (
     <div className="space-y-6">
@@ -131,7 +161,7 @@ export function ResultDetailPage() {
             {formatValue(result.name)}
           </h1>
           <p className="mt-1 text-sm text-slate-600">
-            Result ID: {id}
+            Result ID: {id} • Category: {categoryName}
           </p>
         </div>
         <button onClick={() => navigate(-1)} className="btn btn-secondary">
@@ -140,32 +170,42 @@ export function ResultDetailPage() {
       </div>
 
       {/* Identity Section */}
-      <div className="card p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-slate-900">Identity</h2>
-          <StatusBadge status={result.status} />
+      {(shouldDisplayField('name', categoryName) || shouldDisplayField('brand', categoryName) || shouldDisplayField('property_type', categoryName) || shouldDisplayField('star_rating', categoryName)) && (
+        <div className="card p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-slate-900">Identity</h2>
+            <StatusBadge status={result.status} />
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {shouldDisplayField('name', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Name</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.name)}</p>
+              </div>
+            )}
+            {shouldDisplayField('brand', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Brand</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.brand)}</p>
+              </div>
+            )}
+            {shouldDisplayField('property_type', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Property Type</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.property_type)}</p>
+              </div>
+            )}
+            {shouldDisplayField('star_rating', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Star Rating</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {result.star_rating ? `${result.star_rating} ⭐` : 'Not available'}
+                </p>
+              </div>
+            )}
+          </div>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-sm font-medium text-slate-700">Name</label>
-            <p className="mt-1 text-sm text-slate-900">{formatValue(result.name)}</p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Brand</label>
-            <p className="mt-1 text-sm text-slate-900">{formatValue(result.brand)}</p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Property Type</label>
-            <p className="mt-1 text-sm text-slate-900">{formatValue(result.property_type)}</p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Star Rating</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {result.star_rating ? `${result.star_rating} ⭐` : 'Not available'}
-            </p>
-          </div>
-        </div>
-      </div>
+      )}
 
       {/* Location Section */}
       <div className="card p-6">
@@ -241,108 +281,158 @@ export function ResultDetailPage() {
       </div>
 
       {/* Pricing Section */}
-      <div className="card p-6">
-        <h2 className="text-lg font-semibold text-slate-900 mb-4">Pricing</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-sm font-medium text-slate-700">Minimum Price</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatPrice(result.price_min, result.currency)}
-            </p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Maximum Price</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatPrice(result.price_max, result.currency)}
-            </p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Currency</label>
-            <p className="mt-1 text-sm text-slate-900">{formatValue(result.currency)}</p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Includes Breakfast</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatBoolean(result.includes_breakfast)}
-            </p>
+      {(shouldDisplayField('price_min', categoryName) || shouldDisplayField('price_max', categoryName) || shouldDisplayField('currency', categoryName) || shouldDisplayField('includes_breakfast', categoryName)) && (
+        <div className="card p-6">
+          <h2 className="text-lg font-semibold text-slate-900 mb-4">Pricing</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {shouldDisplayField('price_min', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Minimum Price</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatPrice(result.price_min, result.currency)}
+                </p>
+              </div>
+            )}
+            {shouldDisplayField('price_max', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Maximum Price</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatPrice(result.price_max, result.currency)}
+                </p>
+              </div>
+            )}
+            {shouldDisplayField('currency', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Currency</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.currency)}</p>
+              </div>
+            )}
+            {shouldDisplayField('includes_breakfast', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Includes Breakfast</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatBoolean(result.includes_breakfast)}
+                </p>
+              </div>
+            )}
           </div>
         </div>
-      </div>
+      )}
 
       {/* Reviews Section */}
-      <div className="card p-6">
-        <h2 className="text-lg font-semibold text-slate-900 mb-4">Reviews</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-sm font-medium text-slate-700">Overall Rating</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatRating(result.rating_overall)}
-            </p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Review Count</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {result.review_count ? `${result.review_count} reviews` : 'Not available'}
-            </p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Cleanliness</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatRating(result.rating_cleanliness)}
-            </p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Location</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatRating(result.rating_location)}
-            </p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Facilities</label>
-            <p className="mt-1 text-sm text-slate-900">
-              {formatRating(result.rating_facilities)}
-            </p>
+      {(shouldDisplayField('rating_overall', categoryName) || shouldDisplayField('review_count', categoryName) || shouldDisplayField('rating_cleanliness', categoryName) || shouldDisplayField('rating_location', categoryName) || shouldDisplayField('rating_facilities', categoryName)) && (
+        <div className="card p-6">
+          <h2 className="text-lg font-semibold text-slate-900 mb-4">Reviews</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {shouldDisplayField('rating_overall', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Overall Rating</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatRating(result.rating_overall)}
+                </p>
+              </div>
+            )}
+            {shouldDisplayField('review_count', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Review Count</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {result.review_count ? `${result.review_count} reviews` : 'Not available'}
+                </p>
+              </div>
+            )}
+            {shouldDisplayField('rating_cleanliness', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Cleanliness</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatRating(result.rating_cleanliness)}
+                </p>
+              </div>
+            )}
+            {shouldDisplayField('rating_location', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Location</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatRating(result.rating_location)}
+                </p>
+              </div>
+            )}
+            {shouldDisplayField('rating_facilities', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Facilities</label>
+                <p className="mt-1 text-sm text-slate-900">
+                  {formatRating(result.rating_facilities)}
+                </p>
+              </div>
+            )}
           </div>
         </div>
-      </div>
+      )}
 
       {/* Facilities Section */}
-      <div className="card p-6">
-        <h2 className="text-lg font-semibold text-slate-900 mb-4">Facilities</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="md:col-span-2">
-            <label className="text-sm font-medium text-slate-700">Amenities</label>
-            <div className="mt-2">
-              {formatArray(result.amenities) === 'Not available' ? (
-                <p className="text-sm text-slate-900">Not available</p>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {result.amenities.map((amenity, index) => (
-                    <span
-                      key={index}
-                      className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-primary-100 text-primary-800"
-                    >
-                      {amenity}
-                    </span>
-                  ))}
+      {(shouldDisplayField('amenities', categoryName) || shouldDisplayField('pets_allowed', categoryName) || shouldDisplayField('checkin_time', categoryName) || shouldDisplayField('checkout_time', categoryName) || shouldDisplayField('opening_hours', categoryName) || shouldDisplayField('cuisine_type', categoryName) || shouldDisplayField('description_short', categoryName)) && (
+        <div className="card p-6">
+          <h2 className="text-lg font-semibold text-slate-900 mb-4">Facilities & Details</h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {shouldDisplayField('amenities', categoryName) && (
+              <div className="md:col-span-2">
+                <label className="text-sm font-medium text-slate-700">Amenities</label>
+                <div className="mt-2">
+                  {formatArray(result.amenities) === 'Not available' ? (
+                    <p className="text-sm text-slate-900">Not available</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {result.amenities.map((amenity, index) => (
+                        <span
+                          key={index}
+                          className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-primary-100 text-primary-800"
+                        >
+                          {amenity}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Pets Allowed</label>
-            <p className="mt-1 text-sm text-slate-900">{formatBoolean(result.pets_allowed)}</p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Check-in Time</label>
-            <p className="mt-1 text-sm text-slate-900">{formatValue(result.checkin_time)}</p>
-          </div>
-          <div>
-            <label className="text-sm font-medium text-slate-700">Check-out Time</label>
-            <p className="mt-1 text-sm text-slate-900">{formatValue(result.checkout_time)}</p>
+              </div>
+            )}
+            {shouldDisplayField('description_short', categoryName) && (
+              <div className="md:col-span-2">
+                <label className="text-sm font-medium text-slate-700">Description</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.description_short)}</p>
+              </div>
+            )}
+            {shouldDisplayField('cuisine_type', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Cuisine Type</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.cuisine_type)}</p>
+              </div>
+            )}
+            {shouldDisplayField('opening_hours', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Opening Hours</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.opening_hours)}</p>
+              </div>
+            )}
+            {shouldDisplayField('pets_allowed', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Pets Allowed</label>
+                <p className="mt-1 text-sm text-slate-900">{formatBoolean(result.pets_allowed)}</p>
+              </div>
+            )}
+            {shouldDisplayField('checkin_time', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Check-in Time</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.checkin_time)}</p>
+              </div>
+            )}
+            {shouldDisplayField('checkout_time', categoryName) && (
+              <div>
+                <label className="text-sm font-medium text-slate-700">Check-out Time</label>
+                <p className="mt-1 text-sm text-slate-900">{formatValue(result.checkout_time)}</p>
+              </div>
+            )}
           </div>
         </div>
-      </div>
+      )}
 
       {/* Data Quality Section */}
       <div className="card p-6">

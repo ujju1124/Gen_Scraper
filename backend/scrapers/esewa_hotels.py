@@ -86,7 +86,7 @@ class ESewaHotelsScraper(BaseScraper):
                     await page.wait_for_timeout(500)
 
                     # Extract hotel data from current page
-                    page_hotels = await self._extract_hotels_from_page(page, source.id, location)
+                    page_hotels = await self._extract_hotels_from_page(page, source, db, location)
                     
                     # Add new hotels, stopping exactly at max_results
                     for hotel in page_hotels:
@@ -150,8 +150,8 @@ class ESewaHotelsScraper(BaseScraper):
             await self._debug_page(page, "esewa_error")
             return []
 
-    async def _extract_hotels_from_page(self, page, source_id: int, location: str) -> List[Dict[str, Any]]:
-        """Extract hotel data from the current page using robust selectors."""
+    async def _extract_hotels_from_page(self, page, source: Source, db: Session, location: str) -> List[Dict[str, Any]]:
+        """Extract hotel data from the current page using healing-enabled extraction."""
         hotels = []
 
         # Find all hotel links - try multiple patterns
@@ -160,45 +160,49 @@ class ESewaHotelsScraper(BaseScraper):
 
         for link in hotel_links:
             try:
-                # Extract name - try multiple selectors
-                name = None
-                try:
-                    name_elem = await link.query_selector('h5, h4, h3, .hotel-name, .title, [class*="hotelName"]')
-                    if name_elem:
-                        name = await name_elem.text_content()
-                    else:
-                        # Use link's text content as fallback
-                        name = await link.text_content()
-                    name = name.strip() if name else None
-                except Exception:
-                    pass
+                # Extract name with healing
+                name = await self._extract_field_with_healing(
+                    card=link,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='name'
+                )
                 
                 if not name or len(name) < 3:
                     continue
 
-                # Extract price
+                # Extract price with healing
+                price_text = await self._extract_field_with_healing(
+                    card=link,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='price'
+                )
+                
+                # Parse price from text
                 price_min = None
-                try:
-                    price_elem = await link.query_selector('.price, .hotel-price, span:has-text("NPR"), [class*="price"]')
-                    if price_elem:
-                        price_text = await price_elem.text_content()
-                        price_match = re.search(r'([\d,\.]+)', price_text)
-                        if price_match:
-                            price_min = float(price_match.group(1).replace(',', ''))
-                except Exception:
-                    pass
+                if price_text:
+                    price_match = re.search(r'([\d,\.]+)', price_text)
+                    if price_match:
+                        price_min = float(price_match.group(1).replace(',', ''))
 
-                # Extract rating
+                # Extract rating with healing
+                rating_text = await self._extract_field_with_healing(
+                    card=link,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='rating'
+                )
+                
+                # Parse rating from text
                 rating_overall = None
-                try:
-                    rating_elem = await link.query_selector('.rating, [class*="rating"], [class*="Rating"]')
-                    if rating_elem:
-                        rating_text = await rating_elem.text_content()
-                        rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                        if rating_match:
-                            rating_overall = float(rating_match.group(1))
-                except Exception:
-                    pass
+                if rating_text:
+                    rating_match = re.search(r'(\d+\.?\d*)', rating_text)
+                    if rating_match:
+                        rating_overall = float(rating_match.group(1))
 
                 hotel_data = {
                     "name": name,

@@ -305,8 +305,22 @@ class ScraperOrchestrator:
                     max_results=max_results
                 )
                 
-                # Run scraper (pass location and max_results from job)
-                source_results = await scraper.run(source, db, job.location, max_results=max_results, category_id=job.category_id)
+                # Run scraper (pass location and max_results from job) with timeout
+                try:
+                    source_results = await asyncio.wait_for(
+                        scraper.run(source, db, job.location, max_results=max_results, category_id=job.category_id),
+                        timeout=300.0  # 5 minutes per scraper (increased from 180s)
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "orchestrator.scraper_timeout",
+                        job_id=job.id,
+                        source_id=source.id,
+                        source_name=source.name,
+                        timeout_seconds=300
+                    )
+                    failed_source_ids.append(source.id)
+                    continue
                 
                 if source_results:
                     # Add source_id to each result

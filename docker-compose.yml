@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:15
-    mem_limit: 512m
+    mem_limit: 400m
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -54,12 +54,12 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 400m
     deploy:
       resources:
         limits:
           cpus: '1.0'
-          memory: 512M
+          memory: 400M
     env_file: .env
     environment:
       DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
@@ -75,28 +75,32 @@ services:
 
   worker:
     build: ./backend
-    command: celery -A tasks.scrape_task worker --loglevel=info --pool=solo
+    command: celery -A tasks.scrape_task worker --loglevel=info --pool=solo --max-tasks-per-child=1
     depends_on:
       migrator:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
     restart: unless-stopped
-    shm_size: "1gb"
-    mem_limit: 1500m
-    memswap_limit: 1500m
+    shm_size: "512mb"
+    mem_limit: 2200m
+    memswap_limit: 2200m
     deploy:
       resources:
         limits:
           cpus: '2.0'
-          memory: 1500M
+          memory: 2200M
         reservations:
           cpus: '1.0'
-          memory: 1G
+          memory: 1500M
     env_file: .env
     environment:
       DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
       REDIS_URL: redis://redis:6379/0
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      # Memory optimization flags
+      NODE_OPTIONS: "--max-old-space-size=512"
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ./backend:/app
     dns:

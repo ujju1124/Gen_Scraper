@@ -1,10 +1,11 @@
 """
-Unit tests for Hostelworld scraper stub.
+Unit tests for Hostelworld scraper.
 
-These tests verify that the scraper stub:
-1. Returns empty list (awaiting selectors)
-2. Logs HUMAN CHECKPOINT warning
-3. Inherits from BaseScraper correctly
+These tests verify that the scraper:
+1. Returns a list of results (may be empty if no selectors configured)
+2. Logs scraper.started event
+3. Navigates to correct Hostelworld URL
+4. Inherits from BaseScraper correctly
 """
 
 import pytest
@@ -14,8 +15,8 @@ from models.source import Source
 
 
 @pytest.mark.asyncio
-async def test_hostelworld_scraper_returns_empty_list():
-    """Test that Hostelworld scraper stub returns empty list."""
+async def test_hostelworld_scraper_returns_list():
+    """Test that Hostelworld scraper returns a list (may be empty if no selectors)."""
     scraper = HostelworldScraper()
     
     # Mock dependencies
@@ -34,14 +35,13 @@ async def test_hostelworld_scraper_returns_empty_list():
         max_results=None
     )
     
-    # Assert empty list returned
-    assert results == []
+    # Assert list returned (may be empty if selectors not configured)
     assert isinstance(results, list)
 
 
 @pytest.mark.asyncio
-async def test_hostelworld_scraper_logs_human_checkpoint():
-    """Test that Hostelworld scraper logs HUMAN CHECKPOINT warning."""
+async def test_hostelworld_scraper_logs_scraper_started():
+    """Test that Hostelworld scraper logs scraper.started event."""
     scraper = HostelworldScraper()
     
     # Mock dependencies
@@ -61,21 +61,22 @@ async def test_hostelworld_scraper_logs_human_checkpoint():
             max_results=50
         )
         
-        # Assert logger.warning was called with "scraper.human_checkpoint"
-        mock_logger.warning.assert_called_once()
-        call_args = mock_logger.warning.call_args
+        # Assert logger.info was called with "scraper.started"
+        # Find the call with event "scraper.started"
+        started_calls = [call for call in mock_logger.info.call_args_list 
+                        if len(call[0]) > 0 and call[0][0] == "scraper.started"]
         
-        # First argument should be the event name
-        assert call_args[0][0] == "scraper.human_checkpoint"
+        assert len(started_calls) >= 1, "scraper.started should be logged"
         
-        # Check that required kwargs are present
-        assert "source_name" in call_args[1]
-        assert call_args[1]["source_name"] == "hostelworld"
-        assert "message" in call_args[1]
-        assert "Selectors must be configured" in call_args[1]["message"]
+        # Check that required kwargs are present in the first started call
+        call_kwargs = started_calls[0][1]
+        assert "source_name" in call_kwargs
+        assert call_kwargs["source_name"] == "hostelworld"
+        assert "location" in call_kwargs
+        assert call_kwargs["location"] == "Pokhara"
     
-    # Assert empty results
-    assert results == []
+    # Assert results is a list (may be empty if no selectors configured)
+    assert isinstance(results, list)
 
 
 def test_hostelworld_scraper_has_source_name():
@@ -112,8 +113,8 @@ async def test_hostelworld_scraper_accepts_max_results_parameter():
         max_results=100
     )
     
-    # Should still return empty list (stub)
-    assert results == []
+    # Should return a list
+    assert isinstance(results, list)
 
 
 @pytest.mark.asyncio
@@ -140,8 +141,8 @@ async def test_hostelworld_scraper_accepts_different_locations():
             max_results=None
         )
         
-        # All should return empty list (stub)
-        assert results == []
+        # All should return a list
+        assert isinstance(results, list)
 
 
 def test_hostelworld_scraper_can_be_instantiated():
@@ -153,8 +154,8 @@ def test_hostelworld_scraper_can_be_instantiated():
 
 
 @pytest.mark.asyncio
-async def test_hostelworld_scraper_does_not_call_page_methods():
-    """Test that stub does not attempt to navigate or interact with page."""
+async def test_hostelworld_scraper_navigates_to_url():
+    """Test that scraper navigates to the correct Hostelworld URL."""
     scraper = HostelworldScraper()
     
     # Mock page with tracking
@@ -173,10 +174,11 @@ async def test_hostelworld_scraper_does_not_call_page_methods():
         max_results=None
     )
     
-    # Assert page methods were NOT called (stub should not navigate)
-    mock_page.goto.assert_not_called()
-    mock_page.query_selector.assert_not_called()
-    mock_page.query_selector_all.assert_not_called()
+    # Assert page.goto was called with correct URL
+    mock_page.goto.assert_called()
+    call_args = mock_page.goto.call_args
+    assert "hostelworld.com" in call_args[0][0]
+    assert "kathmandu" in call_args[0][0].lower()
     
-    # Assert empty results
-    assert results == []
+    # Assert results is a list
+    assert isinstance(results, list)

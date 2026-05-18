@@ -47,6 +47,13 @@ KEY_FIELDS = [
     "amenities", "price_min", "latitude", "longitude",
 ]
 
+# Known placeholder/default coordinates that should NOT be used for fuzzy matching
+# These are typically city/district centroids used when accurate GPS data is unavailable
+PLACEHOLDER_COORDS = [
+    (27.7172000, 85.3240000),  # Thamel district centroid, Kathmandu
+    # Add more as discovered during data quality checks
+]
+
 
 class MergingPipeline:
     def __init__(self, db: Session):
@@ -86,6 +93,37 @@ class MergingPipeline:
         
         # Return None if too short to be valid
         return digits if len(digits) >= 7 else None
+
+    def _is_placeholder_coordinate(self, lat: float, lon: float) -> bool:
+        """
+        Check if a coordinate is a known placeholder/default coordinate.
+        
+        Placeholder coordinates are typically city/district centroids used by
+        data sources when accurate GPS data is unavailable. These should NOT
+        be used for fuzzy matching as they cause false positives.
+        
+        Args:
+            lat: Latitude (can be Decimal or float)
+            lon: Longitude (can be Decimal or float)
+            
+        Returns:
+            True if coordinate is a known placeholder, False otherwise
+            
+        Example:
+            _is_placeholder_coordinate(27.7172000, 85.3240000) -> True (Thamel centroid)
+        """
+        # Convert Decimal to float if needed
+        lat_float = float(lat) if lat is not None else None
+        lon_float = float(lon) if lon is not None else None
+        
+        if lat_float is None or lon_float is None:
+            return False
+        
+        for plat, plon in PLACEHOLDER_COORDS:
+            # Use 0.0001 degree tolerance (~11 meters)
+            if abs(lat_float - plat) < 0.0001 and abs(lon_float - plon) < 0.0001:
+                return True
+        return False
 
     def _transliterate_name(self, name: str) -> str:
         """Convert any script (Devanagari/Nepali etc.) to Latin characters."""
@@ -179,19 +217,55 @@ class MergingPipeline:
             return True
         
         # Criterion 2: Coordinate proximity match (within 50 meters)
+        # CRITICAL: Skip coordinate matching if either record has a placeholder coordinate
+        # to prevent false positives from city/district centroids
         if all([record_a.latitude, record_a.longitude, record_b.latitude, record_b.longitude]):
-            distance_km = self._haversine_distance(
-                record_a.latitude, record_a.longitude,
-                record_b.latitude, record_b.longitude
-            )
-            if distance_km <= 0.05:  # 50 meters = 0.05 km
+            # Check for placeholder coordinates first
+            if self._is_placeholder_coordinate(record_a.latitude, record_a.longitude) or \
+               self._is_placeholder_coordinate(record_b.latitude, record_b.longitude):
+                # Skip coordinate matching for placeholder coordinates
                 logger.debug(
-                    "merger.fuzzy_match_coordinates",
+                    "merger.skipped_placeholder_coordinate",
                     record_a_id=str(record_a.id),
                     record_b_id=str(record_b.id),
-                    distance_meters=round(distance_km * 1000, 1)
+                    coord_a=f"({record_a.latitude}, {record_a.longitude})",
+                    coord_b=f"({record_b.latitude}, {record_b.longitude})"
                 )
-                return True
+            else:
+                # Calculate distance for non-placeholder coordinates
+                distance_km = self._haversine_distance(
+                    record_a.latitude, record_a.longitude,
+                    record_b.latitude, record_b.longitude
+                )
+                if distance_km <= 0.05:  # 50 meters = 0.05 km
+                    # CRITICAL: Names must be at least 80% similar to prevent merging
+                    # different businesses at the same location (e.g., in same building)
+                    name_a = self._normalize_business_name(
+                        self._transliterate_name(record_a.name)
+                    )
+                    name_b = self._normalize_business_name(
+                        self._transliterate_name(record_b.name)
+                    )
+                    if name_a and name_b:
+                        similarity = difflib.SequenceMatcher(None, name_a, name_b).ratio()
+                        if similarity >= 0.80:  # 80% threshold (same as name-only matching)
+                            logger.debug(
+                                "merger.fuzzy_match_coordinates_with_name",
+                                record_a_id=str(record_a.id),
+                                record_b_id=str(record_b.id),
+                                distance_meters=round(distance_km * 1000, 1),
+                                name_similarity=round(similarity, 3)
+                            )
+                            return True
+                    # Don't merge if names are too different (likely different businesses at same location)
+                    logger.debug(
+                        "merger.skipped_coordinate_match_low_name_similarity",
+                        record_a_id=str(record_a.id),
+                        record_b_id=str(record_b.id),
+                        distance_meters=round(distance_km * 1000, 1),
+                        name_a=record_a.name,
+                        name_b=record_b.name
+                    )
         
         # Criterion 3: Name fuzzy match with transliteration + normalization (80% similarity threshold)
         if record_a.name and record_b.name:
@@ -217,6 +291,100 @@ class MergingPipeline:
                     return True
         
         return False
+
+    def run_cross_job(self) -> dict:
+        """
+        Cross-job merging pipeline. Groups ALL non-duplicate records across ALL jobs
+        by dedup_key and source, then fuzzy-matches remaining unmatched records.
+
+        This is the fix for the 0.25% merge rate bug where merging only ran within
+        single jobs instead of across jobs from different sources.
+
+        Returns:
+            {"merged_groups": N, "total_records_processed": M, "fuzzy_merged_groups": K}
+        """
+        logger.info("merger.cross_job_pass_starting")
+
+        # ===== PASS 1: Exact dedup_key matching across ALL jobs ===== #
+        # Get all non-duplicate records across every job
+        all_results = self.db.query(CleanedResult).filter(
+            CleanedResult.is_duplicate == False,
+        ).all()
+
+        logger.info("merger.cross_job_records_loaded", total=len(all_results))
+
+        # Group by dedup_key → source_id (one canonical per source per business)
+        dedup_groups: dict[str, dict[int, CleanedResult]] = defaultdict(dict)
+        for r in all_results:
+            if r.dedup_key:
+                if r.source_id not in dedup_groups[r.dedup_key]:
+                    dedup_groups[r.dedup_key][r.source_id] = r
+
+        exact_merged_groups = 0
+        for dedup_key, source_map in dedup_groups.items():
+            if len(source_map) < 2:
+                continue
+            group = list(source_map.values())
+            self._merge_group(group)
+            exact_merged_groups += 1
+
+        self.db.flush()
+        logger.info("merger.cross_job_exact_pass_complete", exact_merged_groups=exact_merged_groups)
+
+        # ===== PASS 2: Fuzzy matching across ALL jobs ===== #
+        non_merged = self.db.query(CleanedResult).filter(
+            CleanedResult.is_duplicate == False,
+            CleanedResult.merged_from_sources == None,
+        ).all()
+
+        logger.info("merger.cross_job_fuzzy_pass_starting", non_merged_count=len(non_merged))
+
+        fuzzy_groups = []
+        processed_ids = set()
+
+        for record in non_merged:
+            if record.id in processed_ids:
+                continue
+            group = [record]
+            processed_ids.add(record.id)
+
+            for other in non_merged:
+                if other.id in processed_ids:
+                    continue
+                if self._are_same_business(record, other):
+                    group.append(other)
+                    processed_ids.add(other.id)
+
+            if len(group) >= 2:
+                fuzzy_groups.append(group)
+
+        fuzzy_merged_groups = 0
+        for group in fuzzy_groups:
+            self._merge_group(group)
+            fuzzy_merged_groups += 1
+            logger.info(
+                "merger.cross_job_fuzzy_group_merged",
+                group_size=len(group),
+                source_ids=[r.source_id for r in group],
+            )
+
+        self.db.commit()
+
+        total_merged_groups = exact_merged_groups + fuzzy_merged_groups
+        logger.info(
+            "merger.cross_job_complete",
+            exact_merged_groups=exact_merged_groups,
+            fuzzy_merged_groups=fuzzy_merged_groups,
+            total_merged_groups=total_merged_groups,
+            total_records_processed=len(all_results),
+        )
+
+        return {
+            "merged_groups": total_merged_groups,
+            "exact_merged_groups": exact_merged_groups,
+            "fuzzy_merged_groups": fuzzy_merged_groups,
+            "total_records_processed": len(all_results),
+        }
 
     def run(self, job_id: str) -> dict:
         """
@@ -353,7 +521,8 @@ class MergingPipeline:
         others = [r for r in group if r.id != canonical.id]
 
         self._merge_fields(canonical, others)
-        canonical.merged_from_sources = [r.source_id for r in group]
+        # Store only DISTINCT source IDs (not duplicates)
+        canonical.merged_from_sources = sorted(list(set(r.source_id for r in group)))
         canonical.merged_at = datetime.now(timezone.utc)
         canonical.confidence_score = self._calculate_confidence(group, canonical)
         canonical.data_completeness = Decimal(str(self._recalculate_completeness(canonical)))

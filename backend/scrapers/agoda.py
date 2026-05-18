@@ -75,7 +75,7 @@ class AgodaScraper(BaseScraper):
                 logger.info("agoda.scraping_page", page=page_num, location=location)
                 
                 # Extract hotels from current page
-                page_hotels = await self._extract_hotels_from_page(page, source.id, location)
+                page_hotels = await self._extract_hotels_from_page(page, source, db, location)
                 
                 if not page_hotels:
                     logger.info("agoda.no_hotels_found", page=page_num)
@@ -103,8 +103,8 @@ class AgodaScraper(BaseScraper):
             await self._debug_page(page, "agoda_error")
             return []
     
-    async def _extract_hotels_from_page(self, page, source_id: int, location: str) -> List[Dict[str, Any]]:
-        """Extract hotel data from the current page using robust selectors."""
+    async def _extract_hotels_from_page(self, page, source: Source, db: Session, location: str) -> List[Dict[str, Any]]:
+        """Extract hotel data from the current page using healing-enabled extraction."""
         hotels = []
         
         # Use locator API (more robust) - try multiple possible selectors
@@ -115,49 +115,68 @@ class AgodaScraper(BaseScraper):
         for i in range(card_count):
             card = cards.nth(i)
             try:
-                # Extract hotel name - try multiple selectors
-                try:
-                    name_elem = card.locator('h3, [data-element-name="property-name"], [class*="PropertyName"]').first
-                    name = await name_elem.text_content(timeout=2000)
-                    name = name.strip() if name else None
-                except Exception:
-                    name = None
+                # Convert Playwright Locator to ElementHandle for healing
+                card_element = await card.element_handle()
+                if not card_element:
+                    continue
+                
+                # Extract fields with healing
+                name = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='name'
+                )
                 
                 if not name:
                     continue
                 
-                # Extract address - optional
-                address = None
-                try:
-                    addr_elem = card.locator('[class*="address"], [class*="location"], p').first
-                    address = await addr_elem.text_content(timeout=1000)
-                    address = address.strip() if address else None
-                except Exception:
-                    pass
+                address = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='address'
+                )
                 
-                # Extract price - look for text containing NPR or numbers
+                price_text = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='price'
+                )
+                
+                rating_text = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='rating'
+                )
+                
+                # Parse price from text
                 price_min = None
-                try:
-                    price_elem = card.locator('[class*="Price"], [class*="price"], text=/NPR|Rs\\.?\\s*[\\d,]+/').first
-                    price_text = await price_elem.text_content(timeout=1000)
+                if price_text:
                     price_match = re.search(r'([\d,\.]+)', price_text)
                     if price_match:
-                        price_min = float(price_match.group(1).replace(',', ''))
-                except Exception:
-                    pass
+                        try:
+                            price_min = float(price_match.group(1).replace(',', ''))
+                        except ValueError:
+                            pass
                 
-                # Extract rating
+                # Parse rating from text
                 rating_overall = None
-                try:
-                    rating_elem = card.locator('[class*="Review"], [class*="rating"], [class*="Rating"]').first
-                    rating_text = await rating_elem.text_content(timeout=1000)
+                if rating_text:
                     rating_match = re.search(r'(\d+\.?\d*)', rating_text)
                     if rating_match:
-                        rating_val = float(rating_match.group(1))
-                        if 0 <= rating_val <= 10:  # Agoda uses 0-10 scale
-                            rating_overall = rating_val
-                except Exception:
-                    pass
+                        try:
+                            rating_val = float(rating_match.group(1))
+                            if 0 <= rating_val <= 10:  # Agoda uses 0-10 scale
+                                rating_overall = rating_val
+                        except ValueError:
+                            pass
                 
                 hotel_data = {
                     "name": name,

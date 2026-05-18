@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     # Scraper settings
     MOCK_MODE: bool = False
     
+    # Detail page scraping settings
+    MAX_DETAIL_PAGES_PER_JOB: int = 10
+    DETAIL_PAGE_DELAY_MIN: int = 3000  # milliseconds
+    DETAIL_PAGE_DELAY_MAX: int = 6000  # milliseconds
+    
     # Geocoding settings
     GEOCODING_ENABLED: bool = True
     OVERPASS_API_URL: str = "https://overpass-api.de/api/interpreter"

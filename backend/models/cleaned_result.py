@@ -79,6 +79,10 @@ class CleanedResult(Base):
     popular_with = Column(JSONB, nullable=True)
     staff_languages = Column(JSONB, nullable=True)
     
+    # Business Info
+    opening_hours = Column(Text, nullable=True)
+    established_year = Column(Integer, nullable=True)
+    
     # Metadata
     source_url = Column(Text, nullable=True)
     source_listing_id = Column(String(200), nullable=True)

@@ -42,13 +42,17 @@ celery_app.conf.update(
 )
 
 
-@celery_app.task(name="tasks.scrape_task")
+@celery_app.task(name="tasks.scrape_task", time_limit=300, soft_time_limit=270)
 def scrape_task(job_id: str):
     """
     Main scrape task entry point.
     
     Routes to either mock implementation (Phase 1) or real orchestrator (Phase 2)
     based on MOCK_MODE environment variable.
+    
+    Time limits:
+    - Soft limit: 270 seconds (4.5 minutes) - raises SoftTimeLimitExceeded
+    - Hard limit: 300 seconds (5 minutes) - kills the task
     
     Args:
         job_id: UUID string of the scrape job
@@ -204,9 +208,13 @@ def real_scrape_task_impl(job_id: str):
     Updates job status: QUEUED → RUNNING → DONE/FAILED
     Saves failed_source_ids to database for retry logic.
     
+    Includes timeout handling to prevent worker crashes.
+    
     Args:
         job_id: UUID string of the scrape job
     """
+    from celery.exceptions import SoftTimeLimitExceeded
+    
     # Convert job_id string to UUID object
     job_uuid = uuid.UUID(job_id)
     
@@ -226,11 +234,26 @@ def real_scrape_task_impl(job_id: str):
         db.commit()
         logger.info("job.started", job_id=job_id, location=job.location, category_id=job.category_id)
         
-        # Run orchestrator (async)
-        orchestrator = ScraperOrchestrator()
-        raw_results, failed_source_ids = asyncio.run(
-            orchestrator.run_async(db, str(job_uuid))
-        )
+        # Run orchestrator (async) with timeout handling
+        try:
+            orchestrator = ScraperOrchestrator()
+            raw_results, failed_source_ids = asyncio.run(
+                orchestrator.run_async(db, str(job_uuid))
+            )
+        except SoftTimeLimitExceeded:
+            logger.error("job.timeout", job_id=job_id, message="Task exceeded soft time limit")
+            job.status = "FAILED"
+            job.error_message = "Task timeout: exceeded 4.5 minute limit"
+            job.completed_at = datetime.utcnow()
+            db.commit()
+            return
+        except Exception as e:
+            logger.error("job.orchestrator_failed", job_id=job_id, error=str(e), exc_info=True)
+            job.status = "FAILED"
+            job.error_message = f"Orchestrator error: {str(e)}"
+            job.completed_at = datetime.utcnow()
+            db.commit()
+            return
         
         logger.info(
             "job.orchestrator_complete",

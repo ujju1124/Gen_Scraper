@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from dependencies import get_db, require_admin
 from models import User, CleanedResult
+from tasks.merge_task import merge_all_sources
 
 router = APIRouter()
 
@@ -645,3 +646,200 @@ def get_monitoring_data(
         "total_results": total_results,
         "recent_failures": recent_failures
     }
+
+
+# Merge All Sources Endpoint (Phase 7 Priority 1 Fix)
+
+class MergeAllSourcesResponse(BaseModel):
+    task_id: str
+    message: str
+
+
+class MergeStatusResponse(BaseModel):
+    total_records_processed: int
+    exact_merged_groups: int
+    exact_merged_records: int
+    fuzzy_merged_groups: int
+    fuzzy_merged_records: int
+    total_merged_groups: int
+    total_merged_records: int
+    merge_rate_percent: float
+
+
+@router.post("/merge-all-sources", response_model=MergeAllSourcesResponse)
+def trigger_merge_all_sources(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Trigger cross-job merging of all records from different sources.
+    
+    - Admin only (role loaded from DB via require_admin)
+    - Fixes critical bug where merging only happened within single jobs
+    - Groups ALL non-duplicate cleaned_results by dedup_key across all jobs
+    - Merges records from different sources that represent the same business
+    - Returns task_id for tracking progress
+    
+    Expected merge rate: 15-20% (720-960 merged records out of 4,790)
+    
+    Example:
+        POST /api/v1/admin/merge-all-sources
+        Response: {"task_id": "abc123", "message": "Merge task started"}
+    """
+    # Trigger Celery task
+    task = merge_all_sources.delay()
+    
+    return {
+        "task_id": task.id,
+        "message": "Cross-job merge task started. This may take several minutes for large datasets."
+    }
+
+
+@router.get("/merge-status", response_model=MergeStatusResponse)
+def get_merge_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Get current merge statistics from database.
+    
+    - Admin only (role loaded from DB via require_admin)
+    - Returns:
+      - total_records_processed: Total cleaned_results in database
+      - merged_records: Count of records with merged_from_sources
+      - merge_rate_percent: Percentage of merged records
+    
+    Example:
+        GET /api/v1/admin/merge-status
+        Response: {
+            "total_records_processed": 4790,
+            "exact_merged_groups": 450,
+            "exact_merged_records": 950,
+            "fuzzy_merged_groups": 50,
+            "fuzzy_merged_records": 120,
+            "total_merged_groups": 500,
+            "total_merged_records": 1070,
+            "merge_rate_percent": 22.34
+        }
+    """
+    from sqlalchemy import func
+    
+    # Get total records
+    total_records = db.query(func.count(CleanedResult.id)).scalar() or 0
+    
+    # Get merged records count
+    merged_records = db.query(func.count(CleanedResult.id)).filter(
+        CleanedResult.merged_from_sources.isnot(None)
+    ).scalar() or 0
+    
+    # Calculate merge rate
+    merge_rate = (merged_records / total_records * 100) if total_records > 0 else 0.0
+    
+    # Note: We can't get exact/fuzzy breakdown from database alone
+    # These would need to be stored in a separate merge_log table
+    # For now, return total merged records
+    
+    return {
+        "total_records_processed": total_records,
+        "exact_merged_groups": 0,  # Not tracked in DB
+        "exact_merged_records": 0,  # Not tracked in DB
+        "fuzzy_merged_groups": 0,  # Not tracked in DB
+        "fuzzy_merged_records": 0,  # Not tracked in DB
+        "total_merged_groups": 0,  # Not tracked in DB
+        "total_merged_records": merged_records,
+        "merge_rate_percent": round(merge_rate, 2)
+    }
+
+
+# Self-Healing Dashboard Endpoint (Phase 7 - KEY SELLING POINT)
+
+class HealingStatsResponse(BaseModel):
+    total_attempts: int
+    resolved: int
+    pending: int
+    success_rate: float
+    avg_confidence: float
+    recent_heals: List[dict]
+
+
+@router.get("/healing-stats", response_model=HealingStatsResponse)
+def get_healing_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Get self-healing system statistics for admin dashboard.
+    
+    - Admin only (role loaded from DB via require_admin)
+    - Returns:
+      - total_attempts: Total healing attempts
+      - resolved: Successfully healed selectors
+      - pending: Selectors awaiting manual review
+      - success_rate: Percentage of resolved heals
+      - avg_confidence: Average confidence score for resolved heals
+      - recent_heals: Last 20 healing attempts with details
+    
+    This is a KEY SELLING POINT - shows the self-healing system in action!
+    
+    Example:
+        GET /api/v1/admin/healing-stats
+        Response: {
+            "total_attempts": 109,
+            "resolved": 21,
+            "pending": 88,
+            "success_rate": 19.3,
+            "avg_confidence": 0.83,
+            "recent_heals": [...]
+        }
+    """
+    from sqlalchemy import text
+    
+    # Get overall stats
+    stats_query = text("""
+        SELECT 
+            COUNT(*) as total,
+            COUNT(CASE WHEN status='RESOLVED' THEN 1 END) as resolved,
+            COUNT(CASE WHEN status='PENDING' THEN 1 END) as pending,
+            ROUND(COUNT(CASE WHEN status='RESOLVED' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 1) as success_rate,
+            ROUND(AVG(CASE WHEN status='RESOLVED' THEN confidence END), 2) as avg_confidence
+        FROM selector_heal_log
+    """)
+    stats = db.execute(stats_query).fetchone()
+    
+    # Get recent heals
+    recent_query = text("""
+        SELECT 
+            shl.field_name,
+            shl.old_selector,
+            shl.new_selector,
+            shl.confidence,
+            shl.status,
+            shl.healed_at,
+            s.name as source_name
+        FROM selector_heal_log shl
+        JOIN sources s ON shl.source_id = s.id
+        ORDER BY shl.healed_at DESC
+        LIMIT 20
+    """)
+    recent = db.execute(recent_query).fetchall()
+    
+    return {
+        "total_attempts": stats.total or 0,
+        "resolved": stats.resolved or 0,
+        "pending": stats.pending or 0,
+        "success_rate": float(stats.success_rate or 0),
+        "avg_confidence": float(stats.avg_confidence or 0),
+        "recent_heals": [
+            {
+                "source_name": r.source_name,
+                "field_name": r.field_name,
+                "old_selector": r.old_selector,
+                "new_selector": r.new_selector,
+                "confidence": float(r.confidence) if r.confidence else 0,
+                "status": r.status,
+                "created_at": r.healed_at.isoformat() if r.healed_at else None
+            }
+            for r in recent
+        ]
+    }
+

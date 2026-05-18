@@ -525,16 +525,17 @@ class TestFuzzyMatchingCoordinateMatch:
         make_source(db_session, 12, "directoryofnepal_hotels")
         job_id = make_job(db_session)
         
-        # Different names, coordinates within 50m
+        # Similar names (>80% similarity), coordinates within 50m
+        # Using non-placeholder coordinates (not Thamel centroid)
         r1 = make_result(
             db_session, job_id, 2,
-            name="Hotel ABC", city="Kathmandu",
-            latitude=27.7172, longitude=85.3240,
+            name="Himalaya Hotel", city="Kathmandu",
+            latitude=27.7100, longitude=85.3200,
         )
         r2 = make_result(
             db_session, job_id, 12,
-            name="Hotel XYZ", city="Kathmandu",
-            latitude=27.7174, longitude=85.3242,  # ~30m away
+            name="Hotel Himalaya", city="Kathmandu",
+            latitude=27.7102, longitude=85.3202,  # ~30m away
         )
         
         pipeline = MergingPipeline(db_session)

@@ -191,11 +191,17 @@ class CleaningPipeline:
         Returns:
             List of deduplicated results
         """
+        logger.info(
+            "dedup.within_job.started",
+            job_id=job_id,
+            result_count=len(results)
+        )
+        
         seen_keys = set()
         deduplicated = []
         duplicate_count = 0
         
-        for result in results:
+        for idx, result in enumerate(results):
             # Generate dedup key
             name = result.get("name", "").lower()
             city = result.get("city", "").lower()
@@ -206,6 +212,14 @@ class CleaningPipeline:
             
             # Mark as duplicate if already seen, but still include so MergingPipeline can access it
             if dedup_key in seen_keys:
+                logger.debug(
+                    "dedup.duplicate_found",
+                    job_id=job_id,
+                    idx=idx,
+                    name=name,
+                    city=city,
+                    dedup_key_prefix=dedup_key[:16]
+                )
                 result["is_duplicate"] = True
                 duplicate_count += 1
             else:
@@ -214,13 +228,13 @@ class CleaningPipeline:
             
             deduplicated.append(result)
         
-        if duplicate_count > 0:
-            logger.info(
-                "dedup.within_job",
-                job_id=job_id,
-                duplicates=duplicate_count,
-                kept=len(deduplicated)
-            )
+        logger.info(
+            "dedup.within_job.complete",
+            job_id=job_id,
+            duplicates=duplicate_count,
+            kept=len(deduplicated),
+            unique_keys=len(seen_keys)
+        )
         
         return deduplicated
     
@@ -461,6 +475,10 @@ class CleaningPipeline:
                 highlights=result.get("highlights"),
                 popular_with=result.get("popular_with"),
                 staff_languages=result.get("staff_languages"),
+                
+                # Business Info
+                opening_hours=result.get("opening_hours"),
+                established_year=result.get("established_year"),
                 
                 # Metadata
                 source_url=result.get("source_url"),

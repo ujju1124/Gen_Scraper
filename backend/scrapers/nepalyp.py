@@ -100,9 +100,10 @@ class NepalYPScraper(BaseScraper):
         all_hotels = []
         page_num = 1
         max_pages = 40  # NepalYP typically has 30-40 pages per category
+        max_results_reached = False  # Flag to track if we've hit max_results
 
         try:
-            while page_num <= max_pages:
+            while page_num <= max_pages and not max_results_reached:
                 # Build URL for current page with dynamic category
                 if page_num == 1:
                     page_url = f"{self.base_url}/category/{category}/city:{location}"
@@ -131,7 +132,7 @@ class NepalYPScraper(BaseScraper):
                 await page.wait_for_timeout(500)
 
                 # Extract hotels from this page
-                page_hotels = await self._extract_hotels_from_page(page, source.id, location)
+                page_hotels = await self._extract_hotels_from_page(page, source, db, location)
 
                 # Add hotels one by one, stopping exactly at max_results
                 for hotel in page_hotels:
@@ -143,8 +144,12 @@ class NepalYPScraper(BaseScraper):
                             count=len(all_hotels),
                             max_results=max_results
                         )
-                        logger.info("nepalyp.scrape_complete", location=location, total=len(all_hotels))
-                        return all_hotels[:max_results]
+                        max_results_reached = True
+                        break  # Break inner loop
+                
+                # If max_results reached, break outer loop too
+                if max_results_reached:
+                    break
 
                 logger.info(
                     "nepalyp.page_extracted",
@@ -179,35 +184,91 @@ class NepalYPScraper(BaseScraper):
 
                 page_num += 1
 
+            # Collect detail URLs from results
+            detail_urls = [r['detail_url'] for r in all_hotels if r.get('detail_url')]
+            
+            logger.info(
+                "nepalyp.detail_urls_collected",
+                source_name=self.source_name,
+                total_hotels=len(all_hotels),
+                urls_found=len(detail_urls),
+                sample_hotel=all_hotels[0] if all_hotels else None,
+                sample_url=detail_urls[0] if detail_urls else None
+            )
+            
+            # Limit to max_detail_pages setting
+            from config import settings
+            max_detail = getattr(settings, 'MAX_DETAIL_PAGES_PER_JOB', 10)
+            detail_urls = detail_urls[:max_detail]
+            
+            logger.info(
+                "nepalyp.detail_urls_after_limit",
+                source_name=self.source_name,
+                max_detail=max_detail,
+                urls_to_visit=len(detail_urls)
+            )
+            
+            if detail_urls:
+                logger.info(
+                    "nepalyp.starting_detail_extraction",
+                    source_name=self.source_name,
+                    detail_page_count=len(detail_urls)
+                )
+                await self._extract_from_detail_pages(
+                    page=page,
+                    source=source,
+                    db=db,
+                    results=all_hotels,
+                    detail_urls=detail_urls
+                )
+
             logger.info("nepalyp.scrape_complete", location=location, total=len(all_hotels))
-            return all_hotels
+            return all_hotels[:max_results] if max_results else all_hotels
 
         except Exception as e:
             logger.error("nepalyp.scrape_error", location=location, error=str(e))
             await self._debug_page(page, "nepalyp_error")
             return all_hotels  # Return whatever we got before the error
 
-    async def _extract_hotels_from_page(self, page, source_id: int, location: str) -> List[Dict[str, Any]]:
-        """Extract hotel data from the current page after scrolling."""
+    async def _extract_hotels_from_page(self, page, source: Source, db: Session, location: str) -> List[Dict[str, Any]]:
+        """Extract hotel data from the current page using healing-enabled extraction."""
         hotels = []
 
-        # Find all company/business links - try multiple selectors
-        company_links = await page.query_selector_all('a[href*="/company/"], .business-item a, .listing-item a, [class*="company"] a')
-        logger.info("nepalyp.links_found", count=len(company_links))
+        # Find all company card containers (not the links themselves)
+        # Structure: <div class="company ..."><div class="company_header"><h3><a>Name</a></h3></div></div>
+        cards = await page.query_selector_all('div.company, div[class*="company "]')
+        
+        logger.info(
+            "nepalyp.cards_found",
+            source_name=self.source_name,
+            card_count=len(cards)
+        )
 
-        for link in company_links:
+        for card in cards:
             try:
-                # Extract name from link text or inner elements
-                name = None
-                try:
-                    name_elem = await link.query_selector('h3, h4, .company-name, .title, [class*="name"]')
-                    if name_elem:
-                        name = await name_elem.text_content()
-                    else:
-                        name = await link.text_content()
+                # Extract company link from card
+                link = await card.query_selector('a[href*="/company/"]')
+                if not link:
+                    continue
+
+                # Get detail URL
+                detail_url = await link.get_attribute('href')
+                if detail_url and not detail_url.startswith('http'):
+                    detail_url = 'https://www.nepalyp.com' + detail_url
+
+                # Extract name with healing - card now contains h3 a structure
+                name = await self._extract_field_with_healing(
+                    card=card,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='name'
+                )
+
+                # Fallback: get text directly from link if healing fails
+                if not name:
+                    name = await link.text_content()
                     name = name.strip() if name else None
-                except Exception:
-                    pass
 
                 if not name or len(name) < 3:
                     continue
@@ -216,41 +277,32 @@ class NepalYPScraper(BaseScraper):
                 if name.lower().strip() in INVALID_NAMES:
                     continue
 
-                # Find parent container for address and contact info
-                try:
-                    parent = await link.evaluate_handle('el => el.parentElement')
-                except Exception:
-                    parent = link
+                # Extract address with healing
+                address = await self._extract_field_with_healing(
+                    card=card,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='address'
+                )
 
-                # Extract address
-                address = None
-                try:
-                    address_el = await parent.query_selector('.address, .location, [class*="address"], [class*="location"]')
-                    if address_el:
-                        address = await address_el.text_content()
-                        address = address.strip() if address else None
-                except Exception:
-                    pass
+                # Extract phone with healing
+                phone = await self._extract_field_with_healing(
+                    card=card,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='phone'
+                )
 
-                # Extract phone
-                phone = None
-                try:
-                    phone_el = await parent.query_selector('a[href^="tel:"], .phone, [class*="phone"]')
-                    if phone_el:
-                        phone = await phone_el.text_content()
-                        phone = phone.strip() if phone else None
-                except Exception:
-                    pass
-
-                # Extract email
-                email = None
-                try:
-                    email_el = await parent.query_selector('a[href^="mailto:"], .email, [class*="email"]')
-                    if email_el:
-                        email = await email_el.text_content()
-                        email = email.strip() if email else None
-                except Exception:
-                    pass
+                # Extract email with healing
+                email = await self._extract_field_with_healing(
+                    card=card,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='email'
+                )
 
                 hotel_data = {
                     "name": name,
@@ -261,6 +313,7 @@ class NepalYPScraper(BaseScraper):
                     "price_min": None,   # NepalYP doesn't list pricing
                     "rating_overall": None,  # NepalYP doesn't list ratings
                     "currency": "NPR",
+                    "detail_url": detail_url,  # Store for detail page extraction
                 }
 
                 hotels.append(hotel_data)
@@ -269,5 +322,125 @@ class NepalYPScraper(BaseScraper):
                 logger.warning("nepalyp.extract_hotel_error", error=str(e))
                 continue
 
+        # Debug logging
+        logger.info(
+            "nepalyp.extraction_complete",
+            source_name=self.source_name,
+            card_count=len(cards),
+            result_count=len(hotels),
+            sample_name=hotels[0].get('name') if hotels else None,
+            sample_url=hotels[0].get('detail_url') if hotels else None
+        )
+
         return hotels
 
+
+    async def _extract_from_detail_pages(
+        self,
+        page,
+        source: Source,
+        db: Session,
+        results: list,
+        detail_urls: list
+    ) -> None:
+        """
+        Visit each NepalYP company page and extract phone, address, website.
+        
+        Args:
+            page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
+            results: List of result dictionaries to enrich
+            detail_urls: List of detail page URLs to visit
+        """
+        import random
+        from config import settings
+        
+        delay_min = getattr(settings, 'DETAIL_PAGE_DELAY_MIN', 2000)
+        delay_max = getattr(settings, 'DETAIL_PAGE_DELAY_MAX', 4000)
+        
+        for idx, url in enumerate(detail_urls):
+            try:
+                logger.info(
+                    "nepalyp.extracting_detail",
+                    source_name=self.source_name,
+                    index=idx + 1,
+                    total=len(detail_urls),
+                    url=url
+                )
+                
+                await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                await page.wait_for_timeout(random.randint(delay_min, delay_max))
+                
+                # Extract ALL phone numbers
+                # Handles both "tel:number" AND "tel: number"
+                phones = await page.evaluate('''() => {
+                    const links = document.querySelectorAll('a[href^="tel"]');
+                    const nums = new Set();
+                    for (const a of links) {
+                        const t = a.textContent.trim();
+                        // Must be at least 7 digits
+                        if (t && /\\d{7,}/.test(t)) {
+                            nums.add(t);
+                        }
+                    }
+                    return [...nums].join(", ");
+                }''')
+                
+                # Extract address
+                address = await page.evaluate('''() => {
+                    const el = document.querySelector('[itemprop="address"], .address, ' +
+                        '.col-address, [class*="address"]');
+                    return el ? el.textContent.trim() : null;
+                }''')
+                
+                # Extract website
+                # Skip google, nepalyp, social media links
+                website = await page.evaluate('''() => {
+                    const skip = ["nepalyp", "google", "facebook",
+                                  "twitter", "youtube", "instagram",
+                                  "linkedin", "tiktok"];
+                    const links = document.querySelectorAll('a[href^="http"]');
+                    for (const a of links) {
+                        const href = a.href.toLowerCase();
+                        if (!skip.some(s => href.includes(s))) {
+                            return a.href;
+                        }
+                    }
+                    return null;
+                }''')
+                
+                # Find matching result by detail_url and merge
+                for result in results:
+                    if result.get('detail_url') == url:
+                        if phones:
+                            result['phone_primary'] = phones
+                        if address and not result.get('address'):
+                            result['address'] = address.strip()
+                        if website:
+                            result['website'] = website
+                        
+                        logger.info(
+                            "nepalyp.detail_merged",
+                            source_name=self.source_name,
+                            name=result.get('name'),
+                            has_phone=bool(phones),
+                            has_address=bool(address),
+                            has_website=bool(website)
+                        )
+                        break
+                        
+            except Exception as e:
+                logger.warning(
+                    "nepalyp.detail_failed",
+                    source_name=self.source_name,
+                    url=url,
+                    error=str(e)
+                )
+                continue
+        
+        logger.info(
+            "nepalyp.detail_extraction_complete",
+            source_name=self.source_name,
+            pages_visited=len(detail_urls)
+        )

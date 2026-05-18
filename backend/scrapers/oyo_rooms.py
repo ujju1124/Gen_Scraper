@@ -72,7 +72,7 @@ class OYORoomsScraper(BaseScraper):
                 logger.info("oyo_rooms.scraping_page", page=page_num, location=location)
                 
                 # Extract hotels from current page
-                page_hotels = await self._extract_hotels_from_page(page, source.id, location)
+                page_hotels = await self._extract_hotels_from_page(page, source, db, location)
                 
                 if not page_hotels:
                     logger.info("oyo_rooms.no_hotels_found", page=page_num)
@@ -100,8 +100,8 @@ class OYORoomsScraper(BaseScraper):
             await self._debug_page(page, "oyo_error")
             return []
     
-    async def _extract_hotels_from_page(self, page, source_id: int, location: str) -> List[Dict[str, Any]]:
-        """Extract hotel data from the current page using robust selectors."""
+    async def _extract_hotels_from_page(self, page, source: Source, db: Session, location: str) -> List[Dict[str, Any]]:
+        """Extract hotel data from the current page using healing-enabled extraction."""
         hotels = []
         
         # Use locator API with multiple possible selectors
@@ -112,51 +112,65 @@ class OYORoomsScraper(BaseScraper):
         for i in range(count):
             card = cards.nth(i)
             try:
-                # Extract name
-                try:
-                    name_elem = card.locator('h3, [data-testid="hotel-name"], .hotelName, [class*="hotelName"]').first
-                    name = await name_elem.text_content(timeout=2000)
-                    name = name.strip() if name else None
-                except Exception:
-                    name = None
+                # Convert Playwright Locator to ElementHandle for healing
+                card_element = await card.element_handle()
+                if not card_element:
+                    continue
+                
+                # Extract name with healing
+                name = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='name'
+                )
                 
                 if not name:
                     continue
                 
-                # Extract address from title attribute or text
-                address = None
-                try:
-                    address_elem = card.locator('[title], .address, [class*="address"]').first
-                    address = await address_elem.get_attribute('title', timeout=1000)
-                    if not address:
-                        address = await address_elem.text_content(timeout=1000)
-                    address = address.strip() if address else None
-                except Exception:
-                    pass
+                # Extract address with healing
+                address = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='address'
+                )
                 
-                # Extract price
+                # Extract price with healing
+                price_text = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='price'
+                )
+                
+                # Parse price from text
                 price_min = None
-                try:
-                    price_elem = card.locator('[data-testid="price"], [class*="price"], [class*="Price"], text=/NPR|Rs/i').first
-                    price_text = await price_elem.text_content(timeout=1000)
+                if price_text:
                     price_match = re.search(r'([\d,\.]+)', price_text)
                     if price_match:
                         price_min = float(price_match.group(1).replace(',', ''))
-                except Exception:
-                    pass
                 
-                # Extract rating
+                # Extract rating with healing
+                rating_text = await self._extract_field_with_healing(
+                    card=card_element,
+                    page=page,
+                    source=source,
+                    db=db,
+                    field_name='rating'
+                )
+                
+                # Parse rating from text
                 rating_overall = None
-                try:
-                    rating_elem = card.locator('[class*="rating"], [class*="Rating"]').first
-                    rating_text = await rating_elem.text_content(timeout=1000)
+                if rating_text:
                     rating_match = re.search(r'(\d+\.?\d*)', rating_text)
                     if rating_match:
                         rating_val = float(rating_match.group(1))
                         if 0 <= rating_val <= 5:
                             rating_overall = rating_val
-                except Exception:
-                    pass
                 
                 hotel_data = {
                     "name": name,

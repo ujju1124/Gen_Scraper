@@ -133,6 +133,7 @@ class DirectoryOfNepalScraper(BaseScraper):
             page_num = 1
             current_url = base_url
             previous_url = None
+            seen_urls = set()  # Track URLs to prevent duplicates
             
             while True:
                 logger.info(f"directoryofnepal.scraping_page page={page_num} url={current_url}")
@@ -156,6 +157,12 @@ class DirectoryOfNepalScraper(BaseScraper):
                         try:
                             name = link.get_text(strip=True)
                             source_url = urljoin("https://www.directoryofnepal.com/", link.get('href', ''))
+                            
+                            # Skip if URL already seen (prevents duplicates from pagination overlap)
+                            if source_url in seen_urls:
+                                logger.debug(f"directoryofnepal.duplicate_url_skipped url={source_url}")
+                                continue
+                            seen_urls.add(source_url)
                             
                             # Find the parent container to get address and description
                             # The structure is typically: h2 a (name), p.addr (address), p (description)
@@ -311,6 +318,80 @@ class DirectoryOfNepalScraper(BaseScraper):
                     if email_link:
                         email = email_link.get_text(strip=True)
                     
+                    # Extract thumbnail_url (business logo/image)
+                    thumbnail_url = None
+                    # Look for business logo or main image
+                    img_selectors = [
+                        'img.business-logo',
+                        'img.listing-image', 
+                        '.business-image img',
+                        '.logo img',
+                        'img[alt*="logo"]',
+                        'img[alt*="Logo"]'
+                    ]
+                    for selector in img_selectors:
+                        img = soup.select_one(selector)
+                        if img:
+                            src = img.get('src')
+                            if src:
+                                # Make absolute URL if relative
+                                if src.startswith('/'):
+                                    thumbnail_url = f"https://www.directoryofnepal.com{src}"
+                                elif src.startswith('http'):
+                                    thumbnail_url = src
+                                break
+                    
+                    # Extract opening_hours
+                    opening_hours = None
+                    # Look for business hours in various formats
+                    hours_selectors = [
+                        '.opening-hours',
+                        '.business-hours',
+                        '.hours',
+                        'div.param:contains("Hours")',
+                        'div.param:contains("Time")',
+                        'div.param:contains("Open")'
+                    ]
+                    for selector in hours_selectors:
+                        hours_elem = soup.select_one(selector)
+                        if hours_elem:
+                            hours_text = hours_elem.get_text(strip=True)
+                            # Clean up the text
+                            if 'Hours:' in hours_text:
+                                opening_hours = hours_text.replace('Hours:', '').strip()
+                            elif 'Time:' in hours_text:
+                                opening_hours = hours_text.replace('Time:', '').strip()
+                            elif 'Open:' in hours_text:
+                                opening_hours = hours_text.replace('Open:', '').strip()
+                            else:
+                                opening_hours = hours_text
+                            break
+                    
+                    # Extract established_year
+                    established_year = None
+                    # Look for establishment year in various formats
+                    year_selectors = [
+                        '.established',
+                        '.since-year',
+                        '.founded',
+                        'div.param:contains("Established")',
+                        'div.param:contains("Since")',
+                        'div.param:contains("Founded")'
+                    ]
+                    for selector in year_selectors:
+                        year_elem = soup.select_one(selector)
+                        if year_elem:
+                            year_text = year_elem.get_text(strip=True)
+                            # Extract 4-digit year
+                            import re
+                            year_match = re.search(r'\b(19|20)\d{2}\b', year_text)
+                            if year_match:
+                                try:
+                                    established_year = int(year_match.group())
+                                except ValueError:
+                                    pass
+                            break
+                    
                     # Build result dictionary
                     result = {
                         'name': listing['name'],
@@ -321,9 +402,12 @@ class DirectoryOfNepalScraper(BaseScraper):
                         'phone_secondary': phone_secondary,
                         'email': email,
                         'website': website,
+                        'thumbnail_url': thumbnail_url,
+                        'opening_hours': opening_hours,
+                        'established_year': established_year,
                         'description': listing['description'],
                         'description_short': listing['description'],
-                        'url': detail_url,
+                        'source_url': detail_url,
                         'category': submajorname
                     }
                     
@@ -341,9 +425,12 @@ class DirectoryOfNepalScraper(BaseScraper):
                         'phone_secondary': None,
                         'email': None,
                         'website': None,
+                        'thumbnail_url': None,
+                        'opening_hours': None,
+                        'established_year': None,
                         'description': listing['description'],
                         'description_short': listing['description'],
-                        'url': listing['source_url'],
+                        'source_url': listing['source_url'],
                         'category': submajorname
                     }
                     results.append(result)
@@ -359,11 +446,15 @@ class DirectoryOfNepalScraper(BaseScraper):
                         'phone_secondary': None,
                         'email': None,
                         'website': None,
+                        'thumbnail_url': None,
+                        'opening_hours': None,
+                        'established_year': None,
                         'description': listing['description'],
                         'description_short': listing['description'],
-                        'url': listing['source_url'],
+                        'source_url': listing['source_url'],
                         'category': submajorname
                     }
+                    results.append(result)
                     results.append(result)
         
         logger.info(f"directoryofnepal.scrape_complete total_results={len(results)}")

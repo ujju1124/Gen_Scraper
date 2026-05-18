@@ -92,14 +92,31 @@ class BaseScraper(ABC):
             self._load_selectors(source.id, db)
             
             # Step 2: Open AsyncCamoufox browser with async context manager
+            # Memory optimization: Minimal browser args for low-RAM environments
             async with AsyncCamoufox(
                 headless=True,
                 os="windows",
-                geoip=False
+                geoip=False,
+                addons=[],  # Disable addons to save memory
+                args=[
+                    '--disable-dev-shm-usage',  # Use /tmp instead of /dev/shm (CRITICAL for Docker)
+                    '--no-sandbox',  # Required for Docker
+                    '--disable-setuid-sandbox',
+                    '--disable-gpu',  # Disable GPU
+                    '--disable-extensions',
+                    '--disable-plugins',
+                    '--disable-sync',
+                    '--disable-default-apps',
+                    '--mute-audio',
+                    '--no-first-run',
+                    # Keep images enabled - needed for proper page rendering
+                ]
             ) as browser:
                 context = await browser.new_context(
                     viewport={"width": 1366, "height": 768},
-                    locale="en-US"
+                    locale="en-US",
+                    java_script_enabled=True,  # Keep JS enabled for dynamic content
+                    bypass_csp=True,  # Bypass CSP for better compatibility
                 )
                 page = await context.new_page()
                 
@@ -194,6 +211,173 @@ class BaseScraper(ABC):
             source_id=source_id,
             selector_count=len(self.selectors)
         )
+    
+    def get_selector(self, field_name: str, fallback: str) -> str:
+        """
+        Get selector value from database with fallback.
+        
+        This method allows scrapers to use database selectors while maintaining
+        a hardcoded fallback for safety. If the selector exists in the database,
+        it will be used; otherwise, the fallback is returned.
+        
+        Args:
+            field_name: Name of the field (e.g., 'name', 'price', 'rating')
+            fallback: Hardcoded fallback selector to use if DB selector not found
+            
+        Returns:
+            Selector string to use with querySelector
+            
+        Example:
+            name_selector = self.get_selector('name', '[data-testid="title"]')
+            element = await page.query_selector(name_selector)
+        """
+        selector_record = self.selectors.get(field_name)
+        if selector_record:
+            logger.debug(
+                "scraper.using_db_selector",
+                field_name=field_name,
+                selector=selector_record.selector
+            )
+            return selector_record.selector
+        else:
+            logger.debug(
+                "scraper.using_fallback_selector",
+                field_name=field_name,
+                fallback=fallback
+            )
+            return fallback
+    
+    async def _extract_field_with_healing(
+        self,
+        card,
+        page,
+        source: Source,
+        db: Session,
+        field_name: str
+    ) -> Optional[str]:
+        """
+        Try selector with automatic healing on failure.
+        
+        This is the core of the reactive healing system. When a selector fails:
+        1. Try extraction on card element with current selector
+        2. If fails: Log failure
+        3. If heal_mode == AUTO: call Inspector.heal() with FULL PAGE
+        4. Inspector reloads page, searches for new selector, updates DB
+        5. If healing succeeds (confidence ≥ 0.7): retry extraction on card with new selector
+        6. If healing fails (confidence < 0.7): return None, save HTML for manual review
+        7. Never crash - always return None on failure
+        
+        Args:
+            card: Playwright ElementHandle to extract from (e.g., property card)
+            page: Playwright Page object for Inspector to reload/navigate
+            source: Source model instance
+            db: SQLAlchemy database session
+            field_name: Name of the field to extract (e.g., 'name', 'price')
+            
+        Returns:
+            Extracted text value or None (never raises exception)
+            
+        Example:
+            name = await self._extract_field_with_healing(card, page, source, db, 'name')
+            if name:
+                data['name'] = name
+        """
+        selector_record = self.selectors.get(field_name)
+        if not selector_record:
+            logger.debug(
+                "selector.not_in_db",
+                field_name=field_name,
+                source_id=source.id
+            )
+            return None
+        
+        try:
+            # Try current selector on card element
+            element = await card.query_selector(selector_record.selector)
+            if element:
+                value = await element.text_content()
+                if value and value.strip():
+                    # Save HTML snapshot hash on successful extraction
+                    await self._save_html_snapshot_hash(page, source.id, field_name, db)
+                    return value.strip()
+            
+            # Selector returned nothing — trigger heal
+            logger.warning(
+                "selector.extraction_failed",
+                field=field_name,
+                selector=selector_record.selector,
+                source_id=source.id
+            )
+            
+            # Only heal once per field per scrape (avoid healing same field for every card)
+            if not hasattr(self, '_healing_attempted'):
+                self._healing_attempted = set()
+            
+            if field_name in self._healing_attempted:
+                # Already tried healing this field in this scrape
+                return None
+            
+            self._healing_attempted.add(field_name)
+            
+            # Reactive healing: attempt AUTO heal immediately
+            if source.heal_mode == "AUTO":
+                logger.info(
+                    "selector.attempting_reactive_heal",
+                    field=field_name,
+                    source_id=source.id
+                )
+                
+                # Pass FULL PAGE to Inspector (not card element)
+                # Inspector needs page to reload and search for new selectors
+                inspector = Inspector(db)
+                new_selector = await inspector.heal(page, source.id, field_name)
+                
+                if new_selector:
+                    # Healing succeeded — update in-memory selector and retry
+                    logger.info(
+                        "selector.reactive_heal_success",
+                        field=field_name,
+                        old_selector=selector_record.selector,
+                        new_selector=new_selector,
+                        source_id=source.id
+                    )
+                    
+                    # Update in-memory selector for rest of scrape
+                    selector_record.selector = new_selector
+                    
+                    # Retry extraction on card with healed selector
+                    element = await card.query_selector(new_selector)
+                    if element:
+                        value = await element.text_content()
+                        if value and value.strip():
+                            return value.strip()
+                else:
+                    logger.warning(
+                        "selector.reactive_heal_failed",
+                        field=field_name,
+                        source_id=source.id,
+                        message="Healing failed or confidence too low - PENDING manual review"
+                    )
+            else:
+                logger.info(
+                    "selector.heal_mode_manual",
+                    field=field_name,
+                    source_id=source.id,
+                    message="heal_mode is MANUAL - skipping AUTO heal"
+                )
+            
+            # Heal failed or MANUAL mode — return None, don't crash
+            return None
+        
+        except Exception as e:
+            logger.error(
+                "selector.unexpected_error",
+                field=field_name,
+                source_id=source.id,
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            return None
     
     def _extract_json_ld(self, html: str) -> dict:
         """
@@ -451,6 +635,55 @@ class BaseScraper(ABC):
         except Exception as e:
             logger.warning(
                 "scraper.html_hash_check_failed",
+                error=str(e)
+            )
+    
+    async def _save_html_snapshot_hash(self, page, source_id: int, field_name: str, db: Session) -> None:
+        """
+        Save HTML snapshot hash after successful extraction.
+        
+        This enables proactive healing by detecting when page structure changes.
+        Only saves hash once per field per scrape to avoid excessive DB writes.
+        
+        Args:
+            page: Playwright page object
+            source_id: ID of the source
+            field_name: Name of the field that was successfully extracted
+            db: SQLAlchemy database session
+        """
+        # Only save hash once per field per scrape
+        if not hasattr(self, '_hash_saved'):
+            self._hash_saved = set()
+        
+        if field_name in self._hash_saved:
+            return
+        
+        self._hash_saved.add(field_name)
+        
+        try:
+            # Get page HTML
+            html = await page.content()
+            
+            # Compute hash
+            html_hash = hashlib.sha256(html.encode()).hexdigest()
+            
+            # Update selector record
+            selector_record = self.selectors.get(field_name)
+            if selector_record:
+                selector_record.html_snapshot_hash = html_hash
+                db.commit()
+                
+                logger.debug(
+                    "scraper.html_hash_saved",
+                    source_id=source_id,
+                    field_name=field_name,
+                    hash=html_hash[:8]
+                )
+        except Exception as e:
+            logger.warning(
+                "scraper.html_hash_save_failed",
+                source_id=source_id,
+                field_name=field_name,
                 error=str(e)
             )
     

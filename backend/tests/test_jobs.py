@@ -183,19 +183,19 @@ def test_paginated_results_respects_page_size(auth_client, mock_sleep):
 
 
 def test_rate_limit_returns_429(auth_client, mock_sleep):
-    """POST /jobs rate limit returns 429 after 10 requests per hour."""
+    """POST /jobs rate limit returns 429 after 200 requests per hour."""
     from limiter import limiter
     limiter.reset()
     
-    # Make 10 requests (the limit)
-    for i in range(10):
+    # Make 200 requests (the limit)
+    for i in range(200):
         response = auth_client.post("/api/v1/jobs/", json={
             "category_id": 1,
             "location": f"City{i}"
         })
         assert response.status_code == 201
     
-    # 11th request should be rate limited
+    # 201st request should be rate limited
     response = auth_client.post("/api/v1/jobs/", json={
         "category_id": 1,
         "location": "TooMany"

@@ -540,18 +540,41 @@ class BookingComScraper(BaseScraper):
                     if review_match:
                         data["review_count"] = int(review_match.group(1))
             
-            # Extract price using data-testid="availability-rate-information"
-            price_elem = await card.query_selector('[data-testid="availability-rate-information"]')
-            if price_elem:
-                price_text = await price_elem.inner_text()
-                if price_text:
-                    # Extract number from "NPR 3,334" or "NPR 3334" or "$150"
-                    price_clean = re.sub(r'[^\d.]', '', price_text)
-                    if price_clean:
-                        try:
-                            data["price_min"] = float(price_clean)
-                        except ValueError:
-                            pass
+            # Extract price using verified selector
+            price_elem = await card.query_selector('[data-testid="price-and-discounted-price"]')
+            price_text = await price_elem.text_content() if price_elem else None
+            price_value = None
+            if price_text:
+                # "NPR 3,690" → remove currency + commas
+                clean = re.sub(r'[^\d.]', '', price_text.replace(',', ''))
+                try:
+                    val = float(clean)
+                    # Valid NPR range: 100 to 500,000
+                    if 100 <= val <= 500000:
+                        price_value = val
+                        logger.info(
+                            "scraper.price_extracted",
+                            source_name=self.source_name,
+                            raw=price_text,
+                            value=val,
+                            hotel=data.get('name', 'UNKNOWN')
+                        )
+                    else:
+                        logger.warning(
+                            "scraper.price_rejected",
+                            source_name=self.source_name,
+                            raw=price_text,
+                            val=val,
+                            hotel=data.get('name', 'UNKNOWN')
+                        )
+                except ValueError:
+                    logger.warning(
+                        "scraper.price_parse_failed",
+                        source_name=self.source_name,
+                        raw=price_text,
+                        hotel=data.get('name', 'UNKNOWN')
+                    )
+            data['price_min'] = price_value
             
             # Extract address using data-testid="address-link"
             address_elem = await card.query_selector('[data-testid="address-link"]')

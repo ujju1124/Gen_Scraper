@@ -107,6 +107,8 @@ class GoogleMapsScraper(BaseScraper):
             # Extract data from each detail page
             results = await self._extract_from_detail_pages(
                 page,
+                source,
+                db,
                 result_urls,
                 location,
                 category,
@@ -258,6 +260,8 @@ class GoogleMapsScraper(BaseScraper):
     async def _extract_from_detail_pages(
         self,
         page,
+        source: Source,
+        db: Session,
         result_urls: list[str],
         location: str,
         category: str,
@@ -268,6 +272,8 @@ class GoogleMapsScraper(BaseScraper):
         
         Args:
             page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
             result_urls: List of business detail page URLs
             location: Location string
             category: Category string
@@ -317,7 +323,7 @@ class GoogleMapsScraper(BaseScraper):
                     continue
                 
                 # Extract business data
-                business_data = await self._extract_business_data(page, url, location, category)
+                business_data = await self._extract_business_data(page, source, db, url, location, category)
                 
                 if business_data:
                     results.append(business_data)
@@ -343,15 +349,19 @@ class GoogleMapsScraper(BaseScraper):
     async def _extract_business_data(
         self,
         page,
+        source: Source,
+        db: Session,
         url: str,
         location: str,
         category: str
     ) -> Optional[dict]:
         """
-        Extract business data from detail page.
+        Extract business data from detail page using healing-enabled extraction.
         
         Args:
             page: Playwright page object
+            source: Source model instance
+            db: SQLAlchemy database session
             url: Current page URL
             location: Location string
             category: Category string
@@ -360,103 +370,119 @@ class GoogleMapsScraper(BaseScraper):
             Dictionary of business data or None if extraction fails
         """
         try:
-            # Extract name
-            name = None
+            # Wait for main content to be available
             try:
-                name_elem = await page.query_selector('h1.DUwDvf, h1.fontHeadlineLarge')
-                if name_elem:
-                    name = await name_elem.text_content()
-                    name = name.strip() if name else None
+                main_elem = await page.wait_for_selector('[role="main"]', timeout=10000)
             except Exception:
-                pass
+                logger.warning("google_maps.main_content_not_found", url=url)
+                return None
+            
+            # Extract name with healing
+            name = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='name'
+            )
             
             if not name:
                 logger.warning("google_maps.name_not_found", url=url)
                 return None
             
-            # Extract address
-            address = None
-            try:
-                address_button = await page.query_selector('[data-item-id="address"]')
-                if address_button:
-                    address_elem = await address_button.query_selector('.Io6YTe')
-                    if address_elem:
-                        address = await address_elem.text_content()
-                        address = address.strip() if address else None
-            except Exception:
-                pass
+            # Extract address with healing
+            address = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='address'
+            )
             
-            # Extract phone
-            phone = None
-            try:
-                phone_button = await page.query_selector('[data-item-id*="phone:tel"]')
-                if phone_button:
-                    phone_elem = await phone_button.query_selector('.Io6YTe')
-                    if phone_elem:
-                        phone = await phone_elem.text_content()
-                        phone = phone.strip() if phone else None
-            except Exception:
-                pass
+            # Extract phone with healing
+            phone = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='phone'
+            )
             
-            # Extract rating and review count
+            # Extract rating with healing
+            rating_text = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='rating'
+            )
+            
+            # Parse rating from text
             rating = None
+            if rating_text:
+                try:
+                    rating = float(rating_text.strip())
+                except (ValueError, AttributeError):
+                    pass
+            
+            # Extract review count with healing
+            review_text = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='review_count'
+            )
+            
+            # Parse review count from text
             review_count = None
-            try:
-                rating_container = await page.query_selector('div.F7nice')
-                if rating_container:
-                    # Rating
-                    rating_elem = await rating_container.query_selector('span[aria-hidden="true"]')
-                    if rating_elem:
-                        rating_text = await rating_elem.text_content()
-                        try:
-                            rating = float(rating_text.strip())
-                        except (ValueError, AttributeError):
-                            pass
-                    
-                    # Review count
-                    review_elem = await rating_container.query_selector('span[aria-label*="reviews"]')
-                    if review_elem:
-                        review_text = await review_elem.get_attribute('aria-label')
-                        if review_text:
-                            # Extract number from text like "774 reviews"
-                            match = re.search(r'([\d,]+)', review_text)
-                            if match:
-                                review_count_str = match.group(1).replace(',', '')
-                                try:
-                                    review_count = int(review_count_str)
-                                except ValueError:
-                                    pass
-            except Exception:
-                pass
+            if review_text:
+                match = re.search(r'([\d,]+)', review_text)
+                if match:
+                    review_count_str = match.group(1).replace(',', '')
+                    try:
+                        review_count = int(review_count_str)
+                    except ValueError:
+                        pass
             
-            # Extract website
+            # Extract website - special handling for href attribute
             website = None
-            try:
-                website_link = await page.query_selector('a[data-item-id="authority"]')
-                if website_link:
-                    website = await website_link.get_attribute('href')
-            except Exception:
-                pass
+            website_selector_record = self.selectors.get('website')
+            if website_selector_record:
+                try:
+                    website_link = await main_elem.query_selector(website_selector_record.selector)
+                    if website_link:
+                        website = await website_link.get_attribute('href')
+                except Exception:
+                    pass
             
-            # Extract category label
-            category_label = None
-            try:
-                category_button = await page.query_selector('button.DkEaL')
-                if category_button:
-                    category_label = await category_button.text_content()
-                    category_label = category_label.strip() if category_label else None
-            except Exception:
-                pass
+            # Extract category label with healing
+            category_label = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='category_label'
+            )
             
-            # Extract business status
-            business_status = None
+            # Extract business status with healing
+            business_status = await self._extract_field_with_healing(
+                card=main_elem,
+                page=page,
+                source=source,
+                db=db,
+                field_name='business_status'
+            )
+            
+            # Extract thumbnail_url (business photo)
+            thumbnail_url = None
             try:
-                status_elem = await page.query_selector('span.ZDu9vd span')
-                if status_elem:
-                    business_status = await status_elem.text_content()
-                    business_status = business_status.strip() if business_status else None
-            except Exception:
-                pass
+                thumbnail_url = await page.evaluate('''() => {
+                    const img = document.querySelector('button[jsaction*="photo"] img, .RZ66Rb.FgCUCc img, [data-photo-index] img');
+                    return img ? img.src : null;
+                }''')
+            except Exception as e:
+                logger.debug("google_maps.thumbnail_extraction_failed", error=str(e))
             
             # Extract coordinates from URL
             latitude, longitude = self._parse_coordinates_from_url(url)
@@ -470,6 +496,7 @@ class GoogleMapsScraper(BaseScraper):
                 "website": website,
                 "rating_overall": rating,
                 "review_count": review_count,
+                "thumbnail_url": thumbnail_url,
                 "latitude": latitude,
                 "longitude": longitude,
                 "category": category_label or category,

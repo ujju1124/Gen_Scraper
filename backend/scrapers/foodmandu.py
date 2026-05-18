@@ -127,56 +127,86 @@ class FoodmanduScraper(BaseScraper):
                     
                     try:
                         card = cards[i]
-                        result = {}
                         
-                        # Extract name (div.title20 a)
-                        name_elem = await card.query_selector("div.title20 a")
-                        if name_elem:
-                            result['name'] = (await name_elem.inner_text()).strip()
+                        # Extract name with healing
+                        name = await self._extract_field_with_healing(
+                            card=card,
+                            page=page,
+                            source=source,
+                            db=db,
+                            field_name='name'
+                        )
                         
-                        # Extract address (div.subtitle > div:first-child span:nth-child(2))
-                        address_elem = await card.query_selector("div.subtitle > div:first-child span:nth-child(2)")
-                        if address_elem:
-                            result['address'] = (await address_elem.inner_text()).strip()
+                        if not name:
+                            continue
                         
-                        # Extract cuisine (div.subtitle > div:nth-child(2) span:nth-child(2))
-                        cuisine_elem = await card.query_selector("div.subtitle > div:nth-child(2) span:nth-child(2)")
-                        if cuisine_elem:
-                            cuisine_text = (await cuisine_elem.inner_text()).strip()
-                            # Store as amenities (cuisine types)
-                            if cuisine_text:
-                                result['amenities'] = [c.strip() for c in cuisine_text.split('|')]
+                        # Extract address with healing
+                        address = await self._extract_field_with_healing(
+                            card=card,
+                            page=page,
+                            source=source,
+                            db=db,
+                            field_name='address'
+                        )
                         
-                        # Extract thumbnail (div.listing__photo img)
-                        img_elem = await card.query_selector("div.listing__photo img")
-                        if img_elem:
-                            img_src = await img_elem.get_attribute('src')
-                            if img_src and not img_src.endswith('no-image.jpg'):
-                                result['thumbnail_url'] = img_src
+                        # Extract cuisine with healing
+                        cuisine_text = await self._extract_field_with_healing(
+                            card=card,
+                            page=page,
+                            source=source,
+                            db=db,
+                            field_name='cuisine'
+                        )
                         
-                        # Extract detail link (div.title20 a href)
-                        link_elem = await card.query_selector("div.title20 a")
-                        if link_elem:
-                            href = await link_elem.get_attribute('href')
-                            if href:
-                                if href.startswith('/'):
-                                    result['url'] = f"https://foodmandu.com{href}"
-                                else:
-                                    result['url'] = href
+                        # Parse cuisine into amenities
+                        amenities = None
+                        if cuisine_text:
+                            amenities = [c.strip() for c in cuisine_text.split('|')]
                         
-                        # Add metadata
-                        result['city'] = "Kathmandu"  # Foodmandu only operates in Kathmandu
-                        result['country'] = 'Nepal'
+                        # Extract thumbnail - special handling for img src
+                        thumbnail_url = None
+                        thumbnail_selector_record = self.selectors.get('thumbnail')
+                        if thumbnail_selector_record:
+                            try:
+                                img_elem = await card.query_selector(thumbnail_selector_record.selector)
+                                if img_elem:
+                                    img_src = await img_elem.get_attribute('src')
+                                    if img_src and not img_src.endswith('no-image.jpg'):
+                                        thumbnail_url = img_src
+                            except Exception:
+                                pass
                         
-                        # Only add if we got at least a name
-                        if result.get('name'):
-                            results.append(result)
-                            logger.debug(
-                                "scraper.card_extracted",
-                                source_name=self.source_name,
-                                name=result['name'],
-                                total_results=len(results)
-                            )
+                        # Extract detail link - special handling for href
+                        url = None
+                        try:
+                            link_elem = await card.query_selector("div.title20 a")
+                            if link_elem:
+                                href = await link_elem.get_attribute('href')
+                                if href:
+                                    if href.startswith('/'):
+                                        url = f"https://foodmandu.com{href}"
+                                    else:
+                                        url = href
+                        except Exception:
+                            pass
+                        
+                        result = {
+                            'name': name,
+                            'address': address,
+                            'amenities': amenities,
+                            'thumbnail_url': thumbnail_url,
+                            'url': url,
+                            'city': "Kathmandu",  # Foodmandu only operates in Kathmandu
+                            'country': 'Nepal'
+                        }
+                        
+                        results.append(result)
+                        logger.debug(
+                            "scraper.card_extracted",
+                            source_name=self.source_name,
+                            name=result['name'],
+                            total_results=len(results)
+                        )
                     
                     except Exception as e:
                         logger.warning(

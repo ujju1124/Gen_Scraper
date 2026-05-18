@@ -55,6 +55,36 @@ class Inspector:
         """
         self.db = db
     
+    def _extract_domain(self, url: str) -> str:
+        """
+        Extract domain from URL for comparison.
+        
+        Examples:
+            https://www.booking.com/hotels -> booking.com
+            https://booking.com/search -> booking.com
+            http://www.example.com:8080/path -> example.com
+        
+        Args:
+            url: Full URL string
+            
+        Returns:
+            Domain without protocol, www, or port
+        """
+        from urllib.parse import urlparse
+        
+        parsed = urlparse(url)
+        domain = parsed.netloc or parsed.path  # netloc for full URLs, path for partial
+        
+        # Remove port if present
+        if ':' in domain:
+            domain = domain.split(':')[0]
+        
+        # Remove www. prefix
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        
+        return domain.lower()
+    
     async def heal(
         self,
         page: Page,
@@ -108,17 +138,39 @@ class Inspector:
         
         old_selector = old_selector_record.selector if old_selector_record else None
         
-        # Reload page to ensure fresh state
-        try:
-            await page.reload(wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            logger.error(
-                "inspector.reload_failed",
+        # Check if page is already on the correct domain
+        current_url = page.url
+        source_domain = self._extract_domain(source.base_url)
+        current_domain = self._extract_domain(current_url)
+        
+        # Only reload if we're not already on the correct domain
+        # During active scrapes, the page is already loaded and reloading causes timeouts
+        if current_domain != source_domain:
+            logger.info(
+                "inspector.reloading_page",
                 source_id=source_id,
                 field_name=field_name,
-                error=str(e)
+                current_domain=current_domain,
+                expected_domain=source_domain
             )
-            return None
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                logger.error(
+                    "inspector.reload_failed",
+                    source_id=source_id,
+                    field_name=field_name,
+                    error=str(e)
+                )
+                return None
+        else:
+            logger.info(
+                "inspector.skip_reload",
+                source_id=source_id,
+                field_name=field_name,
+                reason="already_on_correct_domain",
+                current_url=current_url
+            )
         
         # Find element by hint
         element, selector, selector_type = await self.find_element_by_hint(
@@ -151,7 +203,7 @@ class Inspector:
         
         # Compute confidence
         page_html = await page.content()
-        confidence = await self.compute_confidence(element, field_hint, page_html)
+        confidence = await self.compute_confidence(element, field_hint, page_html, selector_type)
         
         logger.info(
             "inspector.confidence_computed",
@@ -243,101 +295,398 @@ class Inspector:
         field_name: str
     ) -> Tuple[Optional[ElementHandle], Optional[str], Optional[str]]:
         """
-        Find element on page matching field_hint value.
+        Find element on page using multi-strategy search.
         
-        Tries selectors in priority order:
-        1. data-testid attribute
-        2. ARIA role + accessible name
-        3. Structural XPath
-        4. CSS selector
+        STRATEGY 1: ARIA-label search (highest confidence 0.85)
+        STRATEGY 2: data-testid search (confidence 0.90)
+        STRATEGY 3: Field-specific structural patterns (confidence 0.75-0.80)
+        STRATEGY 4: Schema.org microdata (confidence 0.80)
         
         Args:
             page: Playwright page object
-            field_hint: Example value to search for
+            field_hint: Example value to search for (may not be used for structural search)
             field_name: Name of the field (for context)
             
         Returns:
             Tuple of (element, selector, selector_type) or (None, None, None)
         """
-        # Priority 1: data-testid
-        try:
-            # Search for elements with data-testid containing the field name
-            testid_selector = f"[data-testid*='{field_name}']"
-            element = await page.query_selector(testid_selector)
-            if element:
-                # Verify element contains the hint text
-                text_content = await element.text_content()
-                if text_content and field_hint.lower() in text_content.lower():
-                    return element, testid_selector, "testid"
-        except Exception as e:
-            logger.debug("inspector.testid_search_failed", error=str(e))
         
-        # Priority 2: ARIA role + accessible name
+        # STRATEGY 1: ARIA-label search (confidence 0.85)
         try:
-            # Try common ARIA roles
-            for role in ["heading", "link", "button", "textbox", "img"]:
-                aria_selector = f"[role='{role}']"
-                elements = await page.query_selector_all(aria_selector)
+            # Search by aria-label containing field name or hint
+            aria_selectors = [
+                f'[aria-label*="{field_name}"]',
+                f'[aria-label*="{field_name.replace("_", " ")}"]',
+            ]
+            
+            # Add hint-based search if hint is short enough
+            if len(field_hint) <= 20:
+                aria_selectors.append(f'[aria-label*="{field_hint[:10]}"]')
+            
+            for aria_selector in aria_selectors:
+                try:
+                    element = await page.query_selector(aria_selector)
+                    if element:
+                        text = await element.text_content()
+                        if text and len(text.strip()) > 0:
+                            logger.info(
+                                "inspector.aria_label_match",
+                                field_name=field_name,
+                                selector=aria_selector,
+                                confidence=0.85
+                            )
+                            return element, aria_selector, "aria-label"
+                except:
+                    continue
+        except Exception as e:
+            logger.debug("inspector.aria_label_search_failed", field_name=field_name, error=str(e))
+        
+        # STRATEGY 2: data-testid search (confidence 0.90)
+        try:
+            testid_selectors = [
+                f'[data-testid*="{field_name}"]',
+                f'[data-testid*="{field_name.replace("_", "-")}"]',
+                f'[data-testid*="{field_name.replace("_", "")}"]',
+            ]
+            
+            for testid_selector in testid_selectors:
+                try:
+                    element = await page.query_selector(testid_selector)
+                    if element:
+                        logger.info(
+                            "inspector.testid_match",
+                            field_name=field_name,
+                            selector=testid_selector,
+                            confidence=0.90
+                        )
+                        return element, testid_selector, "testid"
+                except:
+                    continue
+        except Exception as e:
+            logger.debug("inspector.testid_search_failed", field_name=field_name, error=str(e))
+        
+        # STRATEGY 3: Field-specific structural patterns (confidence 0.75-0.80)
+        try:
+            if field_name == 'name':
+                # Business names: h1, h2, h3, or elements with "title"/"name" in class
+                # FIX 1: Added NepalYP-specific patterns
+                # FIX 2: Added Booking.com data-testid patterns (highest priority)
+                selectors = [
+                    # Booking.com specific (try first)
+                    '[data-testid="title"]',
+                    'div[data-testid="title"]',
+                    'div[data-testid="title"] a',
+                    # Generic patterns
+                    'h1', 'h2', 'h3',
+                    '[class*="title"]', '[class*="name"]', '[class*="Title"]', '[class*="Name"]',
+                    '[data-testid*="name"]', '[data-testid*="title"]',
+                    # NepalYP-specific patterns
+                    'a[href*="/company/"]',
+                    '.company-name', '.listing-title', '.biz-name', '.business-name',
+                    'div[class*="name"] a',
+                    'td a[href*="company"]',
+                    'h3 a', 'h4 a',  # NepalYP uses h3/h4 not h1
+                ]
+                for selector in selectors:
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        text = await element.text_content()
+                        if text and len(text.strip()) > 2:
+                            # Get more specific selector with class
+                            tag_name = await element.evaluate("el => el.tagName.toLowerCase()")
+                            classes = await element.get_attribute('class')
+                            if classes and tag_name in ['h1', 'h2', 'h3']:
+                                first_class = classes.split()[0]
+                                final_selector = f"{tag_name}.{first_class}"
+                            else:
+                                final_selector = selector
+                            
+                            logger.info(
+                                "inspector.structural_match",
+                                field_name=field_name,
+                                selector=final_selector,
+                                confidence=0.80
+                            )
+                            return element, final_selector, "structural"
+            
+            elif field_name in ['rating', 'rating_overall']:
+                # Ratings: spans/divs with "rating"/"score" in class or aria-label
+                # FIX 2: Handle aria-hidden elements by checking parent aria-labels
                 
-                for element in elements:
-                    # Check accessible name or text content
-                    text_content = await element.text_content()
-                    aria_label = await element.get_attribute("aria-label")
-                    
-                    if text_content and field_hint.lower() in text_content.lower():
-                        return element, aria_selector, "role"
-                    if aria_label and field_hint.lower() in aria_label.lower():
-                        return element, aria_selector, "role"
-        except Exception as e:
-            logger.debug("inspector.aria_search_failed", error=str(e))
+                # GOOGLE MAPS FIX: Try specific Google Maps patterns first with high confidence
+                try:
+                    gmaps_elements = await page.query_selector_all(
+                        '[aria-label*="stars"], '
+                        '[aria-label*="Rated"], '
+                        'span.MW4etd, '
+                        '[jstcache] span[aria-label]'
+                    )
+                    for el in gmaps_elements:
+                        # Check if element or parent has aria-label with digits
+                        label = await el.get_attribute('aria-label')
+                        if not label:
+                            # Check parent
+                            parent = await el.evaluate_handle("el => el.parentElement")
+                            if parent:
+                                label = await parent.get_attribute('aria-label')
+                        
+                        if label and any(c.isdigit() for c in label):
+                            # Get text content to verify it's a rating
+                            text = await el.text_content()
+                            if text and any(c.isdigit() for c in text):
+                                # Get selector
+                                tag_name = await el.evaluate("el => el.tagName.toLowerCase()")
+                                classes = await el.get_attribute('class')
+                                if classes:
+                                    first_class = classes.split()[0]
+                                    final_selector = f"{tag_name}.{first_class}"
+                                else:
+                                    final_selector = tag_name
+                                
+                                logger.info(
+                                    "inspector.gmaps_rating_match",
+                                    field_name=field_name,
+                                    selector=final_selector,
+                                    confidence=0.85
+                                )
+                                return el, final_selector, "gmaps-rating"
+                except Exception as e:
+                    logger.debug("inspector.gmaps_rating_search_failed", error=str(e))
+                
+                selectors = [
+                    '[class*="rating"]', '[class*="score"]', '[class*="Rating"]', '[class*="Score"]',
+                    '[aria-label*="rating"]', '[aria-label*="star"]', '[aria-label*="Rating"]', '[aria-label*="Star"]',
+                    '[data-testid*="rating"]', '[itemprop="ratingValue"]',
+                    # Google Maps specific patterns
+                    'span[aria-label*="star"]',
+                    'span[aria-label*="out of"]',
+                    '[class*="rating"] span',
+                    'span.MW4etd',  # Google Maps current class
+                    '[jslog*="rating"]',
+                ]
+                
+                # First try direct selectors
+                for selector in selectors:
+                    element = await page.query_selector(selector)
+                    if element:
+                        text = await element.text_content()
+                        # Verify it contains a number
+                        if text and any(c.isdigit() for c in text):
+                            logger.info(
+                                "inspector.structural_match",
+                                field_name=field_name,
+                                selector=selector,
+                                confidence=0.75
+                            )
+                            return element, selector, "structural"
+                
+                # FIX 2: Search parent elements with aria-label (for aria-hidden children)
+                try:
+                    parent_elements = await page.query_selector_all('[aria-label*="star"], [aria-label*="rating"], [aria-label*="Star"], [aria-label*="Rating"]')
+                    for parent in parent_elements:
+                        # Get numeric text from aria-label
+                        aria_text = await parent.get_attribute('aria-label')
+                        if aria_text and any(c.isdigit() for c in aria_text):
+                            # Check if parent has child spans (even if aria-hidden)
+                            child_spans = await parent.query_selector_all('span')
+                            if child_spans:
+                                # Use first child span that has numeric content
+                                for child in child_spans:
+                                    child_text = await child.text_content()
+                                    if child_text and any(c.isdigit() for c in child_text):
+                                        # Get selector for this child
+                                        tag_name = await child.evaluate("el => el.tagName.toLowerCase()")
+                                        classes = await child.get_attribute('class')
+                                        if classes:
+                                            first_class = classes.split()[0]
+                                            final_selector = f"{tag_name}.{first_class}"
+                                        else:
+                                            final_selector = f"{tag_name}"
+                                        
+                                        logger.info(
+                                            "inspector.aria_parent_match",
+                                            field_name=field_name,
+                                            selector=final_selector,
+                                            confidence=0.85
+                                        )
+                                        return child, final_selector, "aria-parent"
+                except Exception as e:
+                    logger.debug("inspector.aria_parent_search_failed", error=str(e))
+            
+            elif field_name == 'review_count':
+                # Review counts: spans with "review" in aria-label or class, or numbers in parentheses
+                selectors = [
+                    'span[aria-label*="review"]', 'span[aria-label*="Review"]',
+                    '[class*="review"][class*="count"]', '[class*="Review"][class*="Count"]',
+                    '[data-testid*="review"]'
+                ]
+                for selector in selectors:
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        text = await element.text_content()
+                        if text and any(c.isdigit() for c in text):
+                            logger.info(
+                                "inspector.structural_match",
+                                field_name=field_name,
+                                selector=selector,
+                                confidence=0.75
+                            )
+                            return element, selector, "structural"
+                
+                # Fallback: look for patterns like "(1,234)" or "1234 reviews"
+                all_spans = await page.query_selector_all('span, div')
+                for element in all_spans:
+                    text = await element.text_content()
+                    if text:
+                        text = text.strip()
+                        # Match "(number)" or "number review"
+                        if ('(' in text and ')' in text and any(c.isdigit() for c in text)) or \
+                           ('review' in text.lower() and any(c.isdigit() for c in text)):
+                            tag_name = await element.evaluate("el => el.tagName.toLowerCase()")
+                            classes = await element.get_attribute('class')
+                            if classes:
+                                first_class = classes.split()[0]
+                                final_selector = f"{tag_name}.{first_class}"
+                            else:
+                                final_selector = f"{tag_name}"
+                            
+                            logger.info(
+                                "inspector.structural_match",
+                                field_name=field_name,
+                                selector=final_selector,
+                                confidence=0.70
+                            )
+                            return element, final_selector, "structural"
+            
+            elif field_name in ['address', 'location']:
+                # Addresses: address tag, itemprop, or class containing "address"/"location"
+                # FIX 1: Added NepalYP-specific patterns
+                selectors = [
+                    'address',
+                    '[itemprop="address"]', '[itemprop="streetAddress"]',
+                    '[class*="address"]', '[class*="location"]', '[class*="Address"]', '[class*="Location"]',
+                    '[data-testid*="address"]', '[data-testid*="location"]',
+                    # NepalYP-specific patterns
+                    '.address', '.location',
+                    'span[class*="addr"]',
+                    'div[class*="location"]',
+                ]
+                for selector in selectors:
+                    element = await page.query_selector(selector)
+                    if element:
+                        text = await element.text_content()
+                        if text and len(text.strip()) > 5:
+                            logger.info(
+                                "inspector.structural_match",
+                                field_name=field_name,
+                                selector=selector,
+                                confidence=0.80
+                            )
+                            return element, selector, "structural"
+            
+            elif field_name in ['price', 'price_min', 'price_max']:
+                # Prices: elements with "price"/"rate" in class or itemprop
+                selectors = [
+                    '[class*="price"]', '[class*="rate"]', '[class*="Price"]', '[class*="Rate"]',
+                    '[data-testid*="price"]', '[itemprop="price"]', '[itemprop="priceRange"]'
+                ]
+                for selector in selectors:
+                    element = await page.query_selector(selector)
+                    if element:
+                        text = await element.text_content()
+                        # Verify it contains currency symbol or number
+                        if text and (any(c.isdigit() for c in text) or '$' in text or '₹' in text or '€' in text):
+                            logger.info(
+                                "inspector.structural_match",
+                                field_name=field_name,
+                                selector=selector,
+                                confidence=0.75
+                            )
+                            return element, selector, "structural"
+            
+            elif field_name in ['phone', 'phone_primary']:
+                # Phone numbers: tel: links or itemprop
+                # FIX 1: Added NepalYP-specific patterns
+                selectors = [
+                    'a[href^="tel:"]',
+                    '[itemprop="telephone"]',
+                    '[class*="phone"]', '[class*="Phone"]', '[class*="tel"]',
+                    '[data-testid*="phone"]',
+                    # NepalYP-specific patterns
+                    '[class*="contact"]',
+                    'span[class*="contact"]',
+                    'div[class*="phone"] a',
+                ]
+                for selector in selectors:
+                    element = await page.query_selector(selector)
+                    if element:
+                        logger.info(
+                            "inspector.structural_match",
+                            field_name=field_name,
+                            selector=selector,
+                            confidence=0.80
+                        )
+                        return element, selector, "structural"
         
-        # Priority 3: Structural XPath (search by text content)
+        except Exception as e:
+            logger.debug("inspector.structural_search_failed", field_name=field_name, error=str(e))
+        
+        # STRATEGY 4: Schema.org microdata (confidence 0.80)
         try:
-            # Use XPath to find elements containing the hint text
-            xpath_selector = f"//*[contains(text(), '{field_hint}')]"
-            element = await page.query_selector(f"xpath={xpath_selector}")
-            if element:
-                return element, xpath_selector, "xpath"
+            # Map field names to itemprop values
+            itemprop_map = {
+                'name': ['name'],
+                'address': ['address', 'streetAddress'],
+                'phone': ['telephone'],
+                'phone_primary': ['telephone'],
+                'rating': ['ratingValue'],
+                'rating_overall': ['ratingValue'],
+                'review_count': ['reviewCount'],
+                'price': ['price', 'priceRange'],
+                'price_min': ['price', 'priceRange'],
+            }
+            
+            if field_name in itemprop_map:
+                for itemprop_value in itemprop_map[field_name]:
+                    selector = f'[itemprop="{itemprop_value}"]'
+                    element = await page.query_selector(selector)
+                    if element:
+                        logger.info(
+                            "inspector.itemprop_match",
+                            field_name=field_name,
+                            selector=selector,
+                            confidence=0.80
+                        )
+                        return element, selector, "itemprop"
         except Exception as e:
-            logger.debug("inspector.xpath_search_failed", error=str(e))
+            logger.debug("inspector.itemprop_search_failed", field_name=field_name, error=str(e))
         
-        # Priority 4: CSS selector (last resort - search by class or tag)
-        try:
-            # Get all elements and search by text content
-            all_elements = await page.query_selector_all("*")
-            for element in all_elements:
-                text_content = await element.text_content()
-                if text_content and field_hint.lower() in text_content.lower():
-                    # Try to generate a CSS selector for this element
-                    tag_name = await element.evaluate("el => el.tagName.toLowerCase()")
-                    class_name = await element.get_attribute("class")
-                    
-                    if class_name:
-                        css_selector = f"{tag_name}.{class_name.split()[0]}"
-                    else:
-                        css_selector = tag_name
-                    
-                    return element, css_selector, "css"
-        except Exception as e:
-            logger.debug("inspector.css_search_failed", error=str(e))
-        
-        # No element found
+        # No element found with any strategy
+        logger.warning(
+            "inspector.no_element_found",
+            field_name=field_name,
+            strategies_tried=["aria-label", "testid", "structural", "itemprop"]
+        )
         return None, None, None
     
     async def compute_confidence(
         self,
         element: ElementHandle,
         field_hint: str,
-        page_html: str
+        page_html: str,
+        selector_type: Optional[str] = None
     ) -> float:
         """
         Compute confidence score for a found element.
         
-        Scoring algorithm:
-        - +0.5 for data-testid attribute
-        - +0.3 for ARIA role + accessible name match
-        - +0.2 for XPath structure match
-        - -0.3 if hint appears >3 times on page (ambiguous)
+        Scoring algorithm (updated for multi-strategy search):
+        - aria-parent match: 0.85 (high) - NEW
+        - data-testid match: 0.90 (very high)
+        - aria-label match: 0.85 (high)
+        - itemprop match: 0.80 (high)
+        - structural match (h1, address, etc.): 0.75-0.80 (medium-high)
+        - class*= match with field name: 0.70 (medium)
+        - -0.15 if hint appears >10 times on page (ambiguous) - REDUCED PENALTY
         
         Score is clamped to [0.0, 1.0].
         
@@ -345,41 +694,86 @@ class Inspector:
             element: Found element
             field_hint: Example value that was searched for
             page_html: Full page HTML content
+            selector_type: Optional selector type from find_element_by_hint (e.g., "aria-parent")
             
         Returns:
             Confidence score between 0.0 and 1.0
         """
         score = 0.0
         
-        # +0.5 for data-testid
+        # Check selector_type first (passed from find_element_by_hint)
+        if selector_type == "aria-parent":
+            score = 0.85
+            logger.debug("inspector.confidence_aria_parent", score=score)
+            return score  # Return immediately for high confidence
+        
+        if selector_type == "gmaps-rating":
+            score = 0.85
+            logger.debug("inspector.confidence_gmaps_rating", score=score)
+            return score  # Return immediately for high confidence
+        
+        # Check data-testid (0.90)
         testid = await element.get_attribute("data-testid")
         if testid:
-            score += self.CONFIDENCE_TESTID
+            score = 0.90
             logger.debug("inspector.confidence_testid", testid=testid, score=score)
+            return score  # Return immediately for highest confidence
         
-        # +0.3 for ARIA role + accessible name match
-        role = await element.get_attribute("role")
+        # Check aria-label (0.85)
         aria_label = await element.get_attribute("aria-label")
-        if role and (aria_label or await element.text_content()):
-            score += self.CONFIDENCE_ARIA
-            logger.debug("inspector.confidence_aria", role=role, score=score)
+        if aria_label:
+            score = 0.85
+            logger.debug("inspector.confidence_aria_label", aria_label=aria_label[:50], score=score)
+            return score  # Return immediately for high confidence
         
-        # +0.2 for structural XPath match
-        # Check if element has a stable position in DOM (has ID or unique class)
-        element_id = await element.get_attribute("id")
-        class_name = await element.get_attribute("class")
-        if element_id or (class_name and len(class_name.split()) == 1):
-            score += self.CONFIDENCE_XPATH
-            logger.debug("inspector.confidence_xpath", score=score)
+        # Check itemprop (0.80)
+        itemprop = await element.get_attribute("itemprop")
+        if itemprop:
+            score = 0.80
+            logger.debug("inspector.confidence_itemprop", itemprop=itemprop, score=score)
+            return score  # Return immediately for high confidence
         
-        # -0.3 if hint appears >3 times (ambiguous)
-        hint_count = page_html.lower().count(field_hint.lower())
-        if hint_count > self.AMBIGUITY_THRESHOLD:
-            score -= self.AMBIGUITY_PENALTY
+        # Check structural elements (0.75-0.80)
+        tag_name = await element.evaluate("el => el.tagName.toLowerCase()")
+        if tag_name in ['h1', 'h2', 'address']:
+            score = 0.80
+            logger.debug("inspector.confidence_structural_tag", tag=tag_name, score=score)
+        elif tag_name == 'h3':
+            score = 0.75
+            logger.debug("inspector.confidence_structural_tag", tag=tag_name, score=score)
+        else:
+            # Check for class-based match
+            class_name = await element.get_attribute("class")
+            if class_name:
+                # Check if class contains field-related keywords
+                class_lower = class_name.lower()
+                field_keywords = ['name', 'title', 'rating', 'review', 'address', 'location', 'price', 'phone']
+                if any(keyword in class_lower for keyword in field_keywords):
+                    score = 0.70
+                    logger.debug("inspector.confidence_class_match", class_name=class_name[:50], score=score)
+                else:
+                    score = 0.65
+                    logger.debug("inspector.confidence_generic", score=score)
+            else:
+                # FIX 3: Check for tel: link (high confidence for phone)
+                href = await element.get_attribute("href")
+                if href and href.startswith("tel:"):
+                    score = 0.85
+                    logger.debug("inspector.confidence_tel_link", score=score)
+                else:
+                    score = 0.60
+                    logger.debug("inspector.confidence_no_attributes", score=score)
+        
+        # Apply ambiguity penalty (reduced)
+        # Only penalize if hint appears >10 times (was 5)
+        hint_count = page_html.lower().count(field_hint.lower()) if field_hint else 0
+        if hint_count > 10:
+            penalty = 0.15  # Reduced from 0.20
+            score -= penalty
             logger.debug(
                 "inspector.confidence_ambiguity_penalty",
                 hint_count=hint_count,
-                penalty=self.AMBIGUITY_PENALTY,
+                penalty=penalty,
                 score=score
             )
         
