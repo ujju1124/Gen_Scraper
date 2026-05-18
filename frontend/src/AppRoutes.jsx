@@ -16,6 +16,7 @@ import { AdminPage } from './pages/AdminPage'
 import { SourceManagerPage } from './pages/SourceManagerPage'
 import { UserManagementPage } from './pages/UserManagementPage'
 import { MonitoringDashboard } from './pages/MonitoringDashboard'
+import HealingDashboard from './pages/HealingDashboard'
 
 export function AppRoutes() {
   return (
@@ -106,6 +107,18 @@ export function AppRoutes() {
             <RoleGuard>
               <Layout>
                 <MonitoringDashboard />
+              </Layout>
+            </RoleGuard>
+          </AuthGuard>
+        }
+      />
+      <Route
+        path="/admin/healing"
+        element={
+          <AuthGuard>
+            <RoleGuard>
+              <Layout>
+                <HealingDashboard />
               </Layout>
             </RoleGuard>
           </AuthGuard>

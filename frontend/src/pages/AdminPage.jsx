@@ -814,6 +814,9 @@ export function AdminPage() {
           <Link to="/admin/monitoring" className="btn btn-secondary">
             Monitoring
           </Link>
+          <Link to="/admin/healing" className="btn btn-secondary">
+            🔧 Self-Healing
+          </Link>
         </div>
       </div>
 
