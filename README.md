@@ -38,7 +38,8 @@ An intelligent platform that automatically collects, validates, and maintains co
 | **Business Records** | 5,581+ |
 | **Cities Covered** | 43 |
 | **Categories** | 30 |
-| **Data Sources** | 20+ |
+| **Operational Sources** | 4 (fully operational) |
+| **Sources In Testing** | 5 (under development) |
 | **Data Completeness** | 39.3% avg |
 | **Phone Coverage** | 71% |
 | **Self-Healing Success** | 35.2% |
@@ -62,20 +63,18 @@ An intelligent platform that automatically collects, validates, and maintains co
 
 ## 🌐 Data Sources
 
-### International Platforms
-- Booking.com
-- Agoda
-- Hostelworld
-- OYO Rooms
+### Fully Operational (4 Sources)
+- **Booking.com** - 66 hotels collected
+- **Google Maps** - 1,738 businesses collected
+- **NepalYP** - 1,165+ businesses (15+ categories)
+- **DirectoryOfNepal** - 2,612 businesses (Hotels, Restaurants, Pharmacies)
 
-### Local Platforms
-- NepalYP (15+ categories)
-- DirectoryOfNepal
-- Foodmandu
-- eSewa Hotels
-
-### Geographic Data
-- Google Maps
+### In Testing (5 Sources)
+- **Agoda** - Testing anti-bot measures
+- **Hostelworld** - Optimizing extraction
+- **OYO Rooms** - Limited Nepal coverage
+- **Foodmandu** - Testing infinite scroll
+- **eSewa Hotels** - Evaluating API access
 
 ---
 
