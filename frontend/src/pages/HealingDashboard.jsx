@@ -7,7 +7,7 @@ export default function HealingDashboard() {
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    api.get('/admin/healing-stats')
+    api.get('/api/v1/admin/healing-stats')
       .then(r => { 
         setStats(r.data)
         setLoading(false)
