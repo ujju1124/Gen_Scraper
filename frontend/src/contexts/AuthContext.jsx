@@ -81,8 +81,13 @@ export function AuthProvider({ children }) {
    * @param {string} password
    */
   const login = async (email, password) => {
-    await authService.login(email, password)
-    await refreshUser()
+    setLoading(true)
+    try {
+      await authService.login(email, password)
+      await refreshUser()
+    } finally {
+      setLoading(false)
+    }
   }
 
   /**

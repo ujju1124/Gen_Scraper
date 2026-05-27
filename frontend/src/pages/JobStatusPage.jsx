@@ -73,7 +73,7 @@ export function JobStatusPage() {
         sseService.closeStream(eventSourceRef.current)
       }
     }
-  }, [id, loading, jobStatus])
+  }, [id, loading])  // Don't depend on jobStatus to avoid SSE reconnection loops
 
   // Polling fallback
   useEffect(() => {
@@ -101,7 +101,7 @@ export function JobStatusPage() {
         clearInterval(pollingIntervalRef.current)
       }
     }
-  }, [id, usePolling, jobStatus])
+  }, [id, usePolling])  // Don't depend on jobStatus to avoid polling restart loops
 
   const formatDate = (dateString) => {
     if (!dateString) return 'N/A'
@@ -247,11 +247,95 @@ export function JobStatusPage() {
           )}
         </div>
 
+        {/* Statistics Section */}
+        {jobStatus.status === 'DONE' && jobStatus.statistics && (
+          <div className="mt-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+            <h3 className="text-sm font-semibold text-blue-900 mb-3">📊 Scraping Statistics</h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div>
+                <p className="text-xs text-blue-700 font-medium">Total Scraped</p>
+                <p className="text-2xl font-bold text-blue-900">{jobStatus.statistics.raw_scraped || 0}</p>
+              </div>
+              <div>
+                <p className="text-xs text-green-700 font-medium">New Records</p>
+                <p className="text-2xl font-bold text-green-600">{jobStatus.statistics.new_records || 0}</p>
+              </div>
+              <div>
+                <p className="text-xs text-orange-700 font-medium">Duplicates</p>
+                <p className="text-2xl font-bold text-orange-600">{jobStatus.statistics.duplicates || 0}</p>
+              </div>
+              <div>
+                <p className="text-xs text-purple-700 font-medium">Updated</p>
+                <p className="text-2xl font-bold text-purple-600">{jobStatus.statistics.updated_records || 0}</p>
+              </div>
+            </div>
+            
+            {/* By Source Breakdown */}
+            {jobStatus.statistics.by_source_name && Object.keys(jobStatus.statistics.by_source_name).length > 0 && (
+              <div className="mt-4 pt-4 border-t border-blue-200">
+                <p className="text-xs text-blue-700 font-medium mb-2">Results by Source:</p>
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(jobStatus.statistics.by_source_name).map(([sourceName, count]) => (
+                    <span key={sourceName} className="px-3 py-1 bg-white border border-blue-300 rounded-full text-xs font-medium text-blue-900">
+                      {sourceName}: {count}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Error Message */}
         {jobStatus.status === 'FAILED' && jobStatus.error_message && (
           <div className="mt-6 p-4 bg-red-50 border border-red-200 rounded-lg">
             <p className="text-sm font-medium text-red-800">Error:</p>
             <p className="text-sm text-red-700 mt-1">{jobStatus.error_message}</p>
+          </div>
+        )}
+
+        {/* Progress Indicator for RUNNING status */}
+        {jobStatus.status === 'RUNNING' && (
+          <div className="mt-6">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="animate-spin h-4 w-4 border-2 border-primary-600 border-t-transparent rounded-full"/>
+              <span className="text-sm font-medium text-slate-700">
+                {jobStatus.scraping_progress || 
+                 jobStatus.statistics?.progress_message || 
+                 'Scraping in progress...'}
+              </span>
+            </div>
+            <div className="w-full bg-slate-200 rounded-full h-2.5 mb-2">
+              <div className="bg-primary-600 h-2.5 rounded-full animate-pulse" style={{ width: '75%' }}/>
+            </div>
+            <p className="text-xs text-slate-500">
+              Extracting data from {jobStatus.location || 'target location'}
+            </p>
+          </div>
+        )}
+
+        {/* Progress Indicator for QUEUED status */}
+        {jobStatus.status === 'QUEUED' && (
+          <div className="mt-6">
+            <div className="flex items-center gap-3 mb-2">
+              <div className="animate-pulse h-4 w-4 bg-slate-400 rounded-full"/>
+              <span className="text-sm font-medium text-slate-700">Job queued, waiting to start...</span>
+            </div>
+            <div className="w-full bg-slate-200 rounded-full h-2.5">
+              <div className="bg-slate-400 h-2.5 rounded-full" style={{ width: '10%' }}/>
+            </div>
+          </div>
+        )}
+
+        {/* Progress Indicator for DONE status */}
+        {jobStatus.status === 'DONE' && (
+          <div className="mt-6">
+            <div className="w-full bg-slate-200 rounded-full h-2.5 mb-2">
+              <div className="bg-green-500 h-2.5 rounded-full transition-all duration-500" style={{ width: '100%' }}/>
+            </div>
+            <p className="text-sm text-green-600 font-medium">
+              ✅ Complete — {jobStatus.result_count || 0} results collected
+            </p>
           </div>
         )}
 

@@ -103,11 +103,22 @@ add_*.sql
 *_STATUS.md
 *_FINDINGS.md
 *_SUMMARY.md
-*_FIX.md
+*_FIX*.md
 *_ISSUE*.md
 *_BUG*.md
 *_TEST*.md
 *_CRASH*.md
+*_REPORT.md
+*_GUIDE.md
+*_IMPLEMENTATION*.md
+*_APPLIED*.md
+*_VERIFICATION*.md
+*_EXPLAINED*.md
+*_PRESENTATION*.md
+*_APPROVAL*.md
+*_RESPONSE*.md
+*_CARD.md
+*_REFERENCE*.md
 RECOVERY_STATUS.md
 PROGRESS_UPDATE.md
 STEP*.md
@@ -126,6 +137,50 @@ DETAIL_*.md
 SELF_*.md
 FRESH_*.md
 BOOKING_COM_*.md
+ADMIN_PANEL_*.md
+CLIENT_*.md
+COMPLETE_*.md
+DATABASE_*.md
+DEDUPLICATION_*.md
+DUPLICATE_*.md
+EMAIL_*.md
+FEATURE_*.md
+FIXES_*.md
+FRONTEND_*.md
+GOOGLE_MAPS_*.md
+IMPROVEMENTS_*.md
+LOGIN_*.md
+NEW_ADMIN_*.txt
+PRODUCTION_*.md
+QUICK_*.md
+REALTIME_*.md
+SCRAPING_*.md
+SECURITY_*.md
+SSE_*.md
+STATISTICS_*.md
+SUPERVISOR_*.md
+TASK_*.md
+TESTING_*.md
+TEST_*.txt
+UNLIMITED_*.md
+UPDATED_*.md
+ALL_*.md
+
+# Archive folder
+archive/
+
+# Temporary credentials and test files
+NEW_ADMIN_CREDENTIALS.txt
+TEST_LOGIN.txt
+SECURITY_FIXES_APPLIED.txt
+IMPLEMENTATION_COMPLETE_MAY_25.md
+TEST_RESULTS_SUCCESS.md
+generate_er_diagram.py
+GITHUB_PUSH_INSTRUCTIONS.md
+PUSH_SUCCESS.md
+CLIENT_HANDOVER_CHECKLIST.md
+EMAIL_IMAGE_EXTRACTION_REPORT.md
+REALTIME_STATUS_FIX_APPLIED.md
 
 # Scripts (keep main scripts, ignore temp ones)
 stop-scraping.ps1
@@ -138,9 +193,52 @@ overnight-running-guide.md
 docker-crashed-recovery.ps1
 test_*.py
 check_*.py
+monitor_*.py
+trigger_*.py
+create_*.py
+fix_*.py
+restart_*.py
+skip_*.py
+verify_*.py
+show_*.py
+bulk_*.py
+cancel_*.py
+auto_*.py
+recalculate_*.py
+find_*.py
+get_*.py
+*.ps1
+!deploy-production.ps1
+
+# Temporary SQL and JSON files
+*.sql
+extracted_properties.json
+test_download.csv
+
+# Backend utility scripts
+backend/auto_approve_*.py
+backend/bulk_*.py
+backend/cancel_*.py
+backend/count_*.py
+backend/create_*.py
+backend/find_*.py
+backend/fix_*.py
+backend/get_*.py
+backend/monitor_*.py
+backend/recalculate_*.py
+backend/restart_*.py
+backend/show_*.py
+backend/skip_*.py
+backend/trigger_*.py
+backend/verify_*.py
+backend/celerybeat-schedule
 
 # Reference code (not part of project)
 zubdata/
+google-maps-scraper - Copy/
+
+# Docs folder (keep organized documentation)
+docs/
 
 # GitHub setup guides (temporary)
 GITHUB_SETUP_GUIDE.md

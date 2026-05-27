@@ -40,6 +40,11 @@ class CleaningPipeline:
         "rating_overall", "review_count", "thumbnail_url", "description_short",
         "amenities", "price_min", "latitude", "longitude"
     ]
+
+    # Bonus fields from Go scraper — boost completeness score when present
+    GO_BONUS_FIELDS = [
+        "opening_hours", "source_url",  # mapped to standard columns
+    ]
     
     def __init__(self, db: Session):
         """
@@ -50,7 +55,7 @@ class CleaningPipeline:
         """
         self.db = db
     
-    def process(self, raw_results: list[dict], job_id: str, source_id: int, category_id: int) -> list[dict]:
+    def process(self, raw_results: list[dict], job_id: str, source_id: int, category_id: int) -> tuple[list[dict], int]:
         """
         Run all 7 cleaning steps in order.
         
@@ -61,7 +66,7 @@ class CleaningPipeline:
             category_id: ID of the category for these results
             
         Returns:
-            List of cleaned result dictionaries
+            Tuple of (cleaned result dictionaries, updated record count)
         """
         logger.info(
             "pipeline.started",
@@ -79,27 +84,33 @@ class CleaningPipeline:
         # Step 3: Within-job deduplication
         deduplicated = self._dedup_within_job(normalized, job_id)
         
-        # Step 4: Cross-job deduplication
-        flagged = self._dedup_cross_job(deduplicated, category_id, job_id)
+        # Step 4: Cross-job deduplication (returns non-duplicates and update count)
+        flagged, updated_count = self._dedup_cross_job(deduplicated, category_id, job_id)
+        
+        # Filter out duplicates - they were already updated in _dedup_cross_job
+        # Only new records should be saved to cleaned_results table
+        non_duplicates = [r for r in flagged if not r.get("is_duplicate", False)]
         
         # Step 5: Validate
-        validated = [self._validate(r) for r in flagged]
+        validated = [self._validate(r) for r in non_duplicates]
         
         # Step 6: Compute completeness
         scored = [self._compute_completeness(r) for r in validated]
         
-        # Step 7: Save cleaned results
+        # Step 7: Save cleaned results (only new records, not duplicates)
         self._save_cleaned_results(scored, job_id, source_id, category_id)
         
         logger.info(
             "pipeline.complete",
             job_id=job_id,
             source_id=source_id,
-            total_results=len(raw_results),
-            saved_results=len(scored)
+            total_scraped=len(raw_results),
+            new_records_saved=len(scored),
+            existing_records_updated=updated_count,
+            duplicates_skipped=len(raw_results) - len(scored) - updated_count
         )
         
-        return scored
+        return scored, updated_count
     
     def _save_raw_results(self, raw_results: list[dict], job_id: str, source_id: int) -> None:
         """
@@ -238,12 +249,16 @@ class CleaningPipeline:
         
         return deduplicated
     
-    def _dedup_cross_job(self, results: list[dict], category_id: int, job_id: str) -> list[dict]:
+    def _dedup_cross_job(self, results: list[dict], category_id: int, job_id: str) -> tuple[list[dict], int]:
         """
-        Deduplicate against existing records in cleaned_results.
+        Deduplicate against existing records in cleaned_results with SMART MERGE.
         
         Query cleaned_results for existing rows with same dedup_key and category_id.
-        If found, set is_duplicate=TRUE and still insert (for audit).
+        If found, UPDATE changed fields in existing record (don't skip).
+        Only update fields that:
+        1. New value is not None
+        2. New value is different from existing
+        3. Field is not manually edited (is_edited=False)
         
         Args:
             results: List of deduplicated result dictionaries
@@ -251,9 +266,27 @@ class CleaningPipeline:
             job_id: UUID of the scrape job
             
         Returns:
-            List of results with is_duplicate flag set
+            Tuple of (non-duplicate results list, updated record count)
         """
+        # Fields that can be updated via smart merge
+        UPDATABLE_FIELDS = [
+            'phone_primary', 'phone_secondary', 'whatsapp_number',
+            'email', 'website', 'facebook_url', 'instagram_handle',
+            'address', 'street_address', 'latitude', 'longitude',
+            'price_min', 'price_max', 'price_range_label',
+            'rating_overall', 'review_count', 'rating_cleanliness',
+            'rating_location', 'rating_facilities', 'rating_service', 'rating_value',
+            'thumbnail_url', 'image_urls', 'image_count',
+            'description_short', 'description_full', 'highlights',
+            'amenities', 'opening_hours', 'checkin_time', 'checkout_time',
+            'star_rating', 'cancellation_policy', 'free_cancellation',
+            'pets_allowed', 'breakfast_available', 'includes_breakfast',
+            'includes_taxes', 'established_year', 'extra_data'
+        ]
+        
         duplicate_count = 0
+        updated_count = 0
+        non_duplicates = []
         
         for result in results:
             dedup_key = result.get("dedup_key")
@@ -266,25 +299,103 @@ class CleaningPipeline:
                 ).first()
                 
                 if existing:
+                    # SMART MERGE: Update existing record with new data
+                    updated_fields = []
+                    
+                    # Never update manually edited records
+                    if not existing.is_edited:
+                        for field in UPDATABLE_FIELDS:
+                            new_val = result.get(field)
+                            old_val = getattr(existing, field, None)
+                            
+                            # Normalize phone numbers before comparison to avoid false positives
+                            if field in ['phone_primary', 'phone_secondary', 'whatsapp_number']:
+                                new_val_normalized = self._normalize_phone(new_val) if new_val else None
+                                old_val_normalized = self._normalize_phone(old_val) if old_val else None
+                                
+                                # Only update if normalized values are different
+                                if new_val_normalized and new_val_normalized != old_val_normalized:
+                                    setattr(existing, field, new_val)
+                                    updated_fields.append(field)
+                                continue
+                            
+                            # Update if new value is not None and different from existing
+                            if new_val is not None and new_val != old_val:
+                                # Convert to Decimal for numeric fields
+                                if field in ['latitude', 'longitude', 'price_min', 'price_max',
+                                           'rating_overall', 'rating_cleanliness', 'rating_location',
+                                           'rating_facilities', 'rating_service', 'rating_value']:
+                                    new_val = self._to_decimal(new_val)
+                                
+                                setattr(existing, field, new_val)
+                                updated_fields.append(field)
+                        
+                        if updated_fields:
+                            # Update metadata
+                            existing.updated_at = datetime.utcnow()
+                            existing.scraper_source = result.get('scraper_source', existing.scraper_source)
+                            
+                            # Track which sources contributed to this merged record
+                            source_id = result.get('source_id')
+                            if source_id:
+                                merged_sources = existing.merged_from_sources or []
+                                if source_id not in merged_sources:
+                                    existing.merged_from_sources = merged_sources + [source_id]
+                            
+                            # Recompute completeness score
+                            completeness_result = self._compute_completeness(result)
+                            existing.data_completeness = self._to_decimal(
+                                completeness_result.get('data_completeness')
+                            )
+                            
+                            updated_count += 1
+                            
+                            logger.info(
+                                "dedup.record_updated",
+                                job_id=job_id,
+                                name=existing.name,
+                                dedup_key_prefix=dedup_key[:16],
+                                fields_updated=updated_fields,
+                                field_count=len(updated_fields)
+                            )
+                    else:
+                        logger.debug(
+                            "dedup.skip_edited_record",
+                            job_id=job_id,
+                            name=existing.name,
+                            dedup_key_prefix=dedup_key[:16],
+                            reason="manually_edited"
+                        )
+                    
+                    # Mark as duplicate (don't add to non_duplicates list)
                     result["is_duplicate"] = True
                     duplicate_count += 1
                 else:
-                    # Only set False if within-job dedup didn't already mark it as duplicate
+                    # New record - not a duplicate
                     if not result.get("is_duplicate", False):
                         result["is_duplicate"] = False
+                    non_duplicates.append(result)
             else:
+                # No dedup key - keep as non-duplicate
                 if not result.get("is_duplicate", False):
                     result["is_duplicate"] = False
+                non_duplicates.append(result)
         
-        if duplicate_count > 0:
-            logger.info(
-                "dedup.cross_job",
-                job_id=job_id,
-                duplicates=duplicate_count,
-                total=len(results)
-            )
+        # Commit updates to existing records
+        if updated_count > 0:
+            self.db.commit()
         
-        return results
+        logger.info(
+            "dedup.cross_job.complete",
+            job_id=job_id,
+            total_input=len(results),
+            duplicates_found=duplicate_count,
+            records_updated=updated_count,
+            new_records=len(non_duplicates)
+        )
+        
+        # Return non-duplicate results and update count
+        return non_duplicates, updated_count
     
     def _validate(self, result: dict) -> dict:
         """
@@ -360,21 +471,12 @@ class CleaningPipeline:
         Count non-NULL fields from 14 key fields and compute percentage.
         Formula: (count of non-NULL fields / 14) * 100
         
-        14 key fields: name, address, city, phone_primary, email, website,
-        rating_overall, review_count, thumbnail_url, description_short,
-        amenities, price_min, latitude, longitude
-        
-        Args:
-            result: Result dictionary
-            
-        Returns:
-            Result dictionary with data_completeness field
+        Go scraper results get a bonus for extra_data richness.
         """
         non_null_count = 0
         
         for field in self.KEY_FIELDS:
             if field in result and result[field] is not None:
-                # Check for non-empty strings
                 if isinstance(result[field], str):
                     if result[field].strip():
                         non_null_count += 1
@@ -382,6 +484,15 @@ class CleaningPipeline:
                     non_null_count += 1
         
         completeness = (non_null_count / len(self.KEY_FIELDS)) * 100
+
+        # Bonus for Go scraper extra_data richness (up to +10%)
+        extra_data = result.get("extra_data")
+        if extra_data and isinstance(extra_data, dict):
+            bonus_fields = ["place_id", "open_hours", "user_reviews", "images",
+                            "complete_address", "popular_times"]
+            bonus_count = sum(1 for f in bonus_fields if extra_data.get(f))
+            completeness = min(100.0, completeness + (bonus_count * 1.5))
+
         result["data_completeness"] = round(completeness, 2)
         
         return result
@@ -486,7 +597,11 @@ class CleaningPipeline:
                 data_completeness=self._to_decimal(result.get("data_completeness")),
                 is_edited=False,
                 is_duplicate=result.get("is_duplicate", False),
-                status="PENDING"
+                status="PENDING",
+
+                # Go scraper integration
+                scraper_source=result.get("scraper_source"),
+                extra_data=result.get("extra_data") or None,
             )
             
             self.db.add(cleaned_record)
@@ -526,3 +641,31 @@ class CleaningPipeline:
             return Decimal(str(value))
         except (ValueError, TypeError):
             return None
+    
+    @staticmethod
+    def _normalize_phone(phone: Any) -> str | None:
+        """
+        Normalize phone number by removing all formatting characters.
+        
+        This prevents false positives when comparing phone numbers:
+        - "061450617" and "061-450617" are the same
+        - "9806639804" and "980-6639804" are the same
+        
+        Args:
+            phone: Phone number string (may include dashes, spaces, parentheses)
+            
+        Returns:
+            Normalized phone string (digits and + only) or None
+        """
+        if not phone:
+            return None
+        
+        phone_str = str(phone).strip()
+        if not phone_str:
+            return None
+        
+        # Remove all formatting: dashes, spaces, parentheses, dots
+        # Keep only digits and + (for international prefix)
+        normalized = re.sub(r'[^\d+]', '', phone_str)
+        
+        return normalized if normalized else None

@@ -10,6 +10,7 @@ from dependencies import get_db, get_current_user
 from models import User
 from services import auth_service
 from config import settings
+from limiter import limiter
 
 router = APIRouter()
 
@@ -34,8 +35,10 @@ class UserResponse(BaseModel):
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
+@limiter.limit("3/minute")  # Prevent registration spam and email enumeration
 def register(
-    request: RegisterRequest,
+    request: Request,
+    register_request: RegisterRequest,
     response: Response,
     db: Session = Depends(get_db)
 ):
@@ -48,7 +51,7 @@ def register(
     - Returns 400 if email already exists
     """
     # Check if email already exists
-    existing_user = db.query(User).filter(User.email == request.email).first()
+    existing_user = db.query(User).filter(User.email == register_request.email).first()
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -56,11 +59,11 @@ def register(
         )
     
     # Hash password
-    password_hash = auth_service.hash_password(request.password)
+    password_hash = auth_service.hash_password(register_request.password)
     
     # Create user with role='user' (never accept role from request)
     user = User(
-        email=request.email,
+        email=register_request.email,
         password_hash=password_hash,
         role="user",
         is_active=True
@@ -81,8 +84,10 @@ def register(
 
 
 @router.post("/login")
+@limiter.limit("5/minute")  # Prevent brute force attacks
 def login(
-    request: LoginRequest,
+    request: Request,
+    login_request: LoginRequest,
     response: Response,
     db: Session = Depends(get_db)
 ):
@@ -94,9 +99,9 @@ def login(
     - Sets httpOnly cookies with appropriate security settings
     """
     # Find user by email
-    user = db.query(User).filter(User.email == request.email).first()
+    user = db.query(User).filter(User.email == login_request.email).first()
     
-    if not user or not auth_service.verify_password(request.password, user.password_hash):
+    if not user or not auth_service.verify_password(login_request.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password"
@@ -153,6 +158,7 @@ def login(
 
 
 @router.post("/refresh/")
+@limiter.limit("10/minute")  # Prevent token refresh abuse
 def refresh(
     request: Request,
     response: Response,

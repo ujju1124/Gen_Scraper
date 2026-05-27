@@ -200,10 +200,10 @@ class BookingComScraper(BaseScraper):
             #   3. Click button → wait for new cards → extract → repeat
             #   4. Stop when: limit reached OR no new cards after click/scroll
             load_more_clicks = 0
-            max_load_more = 5  # Reduced from 20 to prevent hangs
+            max_load_more = 20  # Allow up to 20 clicks for comprehensive scraping
             consecutive_no_change = 0
             pagination_start_time = time.time()
-            max_pagination_time = 60  # Maximum 60 seconds for pagination
+            max_pagination_time = 300  # 5 minutes max for pagination (increased for max scraping)
             
             logger.info(
                 "scraper.starting_pagination",
@@ -307,15 +307,46 @@ class BookingComScraper(BaseScraper):
                     
                     # --- STEP 3: Click and wait for new cards to appear in DOM ---
                     cards_before_click = len(await page.query_selector_all('[data-testid="property-card"]'))
-                    await load_more_button.click()
-                    load_more_clicks += 1
                     
-                    logger.info(
-                        "scraper.clicked_load_more",
-                        source_name=self.source_name,
-                        click_number=load_more_clicks,
-                        cards_before=cards_before_click
-                    )
+                    # Try clicking with timeout and retry logic
+                    try:
+                        # Scroll button into view first
+                        await load_more_button.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(500)
+                        
+                        # Click with explicit timeout
+                        await load_more_button.click(timeout=10000)  # 10 second timeout
+                        load_more_clicks += 1
+                        
+                        logger.info(
+                            "scraper.clicked_load_more",
+                            source_name=self.source_name,
+                            click_number=load_more_clicks,
+                            cards_before=cards_before_click
+                        )
+                    except Exception as click_error:
+                        logger.warning(
+                            "scraper.load_more_click_failed",
+                            source_name=self.source_name,
+                            clicks=load_more_clicks,
+                            error=str(click_error)
+                        )
+                        # Try alternative: JavaScript click
+                        try:
+                            await page.evaluate('(button) => button.click()', load_more_button)
+                            load_more_clicks += 1
+                            logger.info(
+                                "scraper.clicked_load_more_via_js",
+                                source_name=self.source_name,
+                                click_number=load_more_clicks
+                            )
+                        except Exception as js_error:
+                            logger.error(
+                                "scraper.load_more_js_click_failed",
+                                source_name=self.source_name,
+                                error=str(js_error)
+                            )
+                            break  # Give up on this button
                     
                     # Wait up to 8s for new cards to appear in DOM
                     waited = 0
@@ -382,6 +413,8 @@ class BookingComScraper(BaseScraper):
                 source_name=self.source_name,
                 location=location,
                 load_more_clicks=load_more_clicks,
+                max_load_more=max_load_more,
+                reached_limit=(load_more_clicks >= max_load_more),
                 result_count=len(results)
             )
             
@@ -402,14 +435,25 @@ class BookingComScraper(BaseScraper):
                 result_count=len(results)
             )
             
-            # Step 2: Limit to max_detail_pages (default 10)
-            max_detail_pages = getattr(settings, 'MAX_DETAIL_PAGES_PER_JOB', 10)
-            if max_detail_pages and len(detail_urls) > max_detail_pages:
+            # Step 2: Apply max_detail_pages limit if configured
+            # Set to 0 or None to scrape ALL detail pages (no limit)
+            # Set to positive number to limit (e.g., 50, 100, 200)
+            max_detail_pages = getattr(settings, 'MAX_DETAIL_PAGES_PER_JOB', None)
+            
+            if max_detail_pages and max_detail_pages > 0 and len(detail_urls) > max_detail_pages:
                 detail_urls = detail_urls[:max_detail_pages]
                 logger.info(
                     "scraper.detail_urls_limited",
                     source_name=self.source_name,
-                    total_urls=len(detail_urls),
+                    original_count=len(detail_urls),
+                    limited_to=max_detail_pages,
+                    max_detail_pages=max_detail_pages
+                )
+            else:
+                logger.info(
+                    "scraper.detail_urls_no_limit",
+                    source_name=self.source_name,
+                    detail_page_count=len(detail_urls),
                     max_detail_pages=max_detail_pages
                 )
             
@@ -418,7 +462,8 @@ class BookingComScraper(BaseScraper):
                 logger.info(
                     "scraper.starting_detail_extraction",
                     source_name=self.source_name,
-                    detail_page_count=len(detail_urls)
+                    detail_page_count=len(detail_urls),
+                    estimated_time_minutes=round(len(detail_urls) * 0.15, 1)  # ~9 seconds per page average
                 )
                 
                 await self._extract_from_detail_pages(
@@ -710,7 +755,7 @@ class BookingComScraper(BaseScraper):
                 
                 # Navigate to detail page with timeout and error handling
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)  # Reduced from 20s to 15s
                 except Exception as e:
                     logger.warning(
                         "scraper.detail_navigation_failed",
@@ -719,10 +764,6 @@ class BookingComScraper(BaseScraper):
                         error=str(e)
                     )
                     continue
-                
-                # Random delay between pages (3-6 seconds default)
-                delay = random.randint(delay_min, delay_max)
-                await page.wait_for_timeout(delay)
                 
                 # Check for CAPTCHA
                 if await self._detect_captcha(page):
@@ -736,11 +777,11 @@ class BookingComScraper(BaseScraper):
                 
                 # Wait for main content - use verified selector
                 try:
-                    await page.wait_for_selector('h2, [data-testid="property-header"], .pp-header__title', timeout=15000)
+                    await page.wait_for_selector('h2, [data-testid="property-header"], .pp-header__title', timeout=10000)  # Reduced from 15s to 10s
                 except Exception:
                     # Page may have loaded without this selector
                     # Continue anyway and try extraction
-                    logger.warning(
+                    logger.debug(
                         "scraper.detail_selector_timeout",
                         source_name=self.source_name,
                         url=url
@@ -762,6 +803,10 @@ class BookingComScraper(BaseScraper):
                                 fields_added=list(detail_data.keys())
                             )
                             break
+                
+                # Random delay between pages (1-2 seconds, reduced from 3-6)
+                delay = random.randint(delay_min, delay_max)
+                await page.wait_for_timeout(delay)
                 
             except Exception as e:
                 logger.warning(

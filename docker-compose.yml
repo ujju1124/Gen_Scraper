@@ -74,8 +74,10 @@ services:
       - scraper_network
 
   worker:
-    build: ./backend
-    command: celery -A tasks.scrape_task worker --loglevel=info --pool=solo --max-tasks-per-child=1
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    command: celery -A tasks.scrape_task worker --loglevel=info --concurrency=4 --max-tasks-per-child=1
     depends_on:
       migrator:
         condition: service_completed_successfully
@@ -83,16 +85,16 @@ services:
         condition: service_healthy
     restart: unless-stopped
     shm_size: "512mb"
-    mem_limit: 2200m
-    memswap_limit: 2200m
+    mem_limit: 6000m
+    memswap_limit: 6000m
     deploy:
       resources:
         limits:
-          cpus: '2.0'
-          memory: 2200M
+          cpus: '6.0'
+          memory: 6000M
         reservations:
-          cpus: '1.0'
-          memory: 1500M
+          cpus: '3.0'
+          memory: 3000M
     env_file: .env
     environment:
       DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
@@ -107,6 +109,136 @@ services:
       - 100.127.255.165
       - 100.127.255.73
       - 8.8.8.8
+    networks:
+      - scraper_network
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    command: celery -A tasks.scrape_task beat --loglevel=info
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://scraper:scraper_pass@postgres:5432/scraper_db
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+    networks:
+      - scraper_network
+
+  go_scraper_1:
+    container_name: go_scraper_1
+    build:
+      context: ./google-maps-scraper - Copy
+      dockerfile: Dockerfile
+    command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    mem_limit: 1200m
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1200M
+    volumes:
+      - go_scraper_data_1:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - scraper_network
+
+  go_scraper_2:
+    container_name: go_scraper_2
+    build:
+      context: ./google-maps-scraper - Copy
+      dockerfile: Dockerfile
+    command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+    mem_limit: 1200m
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1200M
+    volumes:
+      - go_scraper_data_2:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - scraper_network
+
+  go_scraper_3:
+    container_name: go_scraper_3
+    build:
+      context: ./google-maps-scraper - Copy
+      dockerfile: Dockerfile
+    command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
+    ports:
+      - "8082:8080"
+    restart: unless-stopped
+    mem_limit: 1200m
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1200M
+    volumes:
+      - go_scraper_data_3:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - scraper_network
+
+  go_scraper_4:
+    container_name: go_scraper_4
+    build:
+      context: ./google-maps-scraper - Copy
+      dockerfile: Dockerfile
+    command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
+    ports:
+      - "8083:8080"
+    restart: unless-stopped
+    mem_limit: 1200m
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1200M
+    volumes:
+      - go_scraper_data_4:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     networks:
       - scraper_network
 
@@ -133,8 +265,27 @@ services:
     networks:
       - scraper_network
 
+  pgadmin:
+    image: dpage/pgadmin4:8.14
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "pgadmin@pgadmin.com"
+      PGADMIN_DEFAULT_PASSWORD: "pgadmin"
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+      PGADMIN_CONFIG_WTF_CSRF_ENABLED: "False"
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - scraper_network
+
 volumes:
   postgres_data:
+  go_scraper_data_1:
+  go_scraper_data_2:
+  go_scraper_data_3:
+  go_scraper_data_4:
 
 networks:
   scraper_network:

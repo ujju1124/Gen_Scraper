@@ -374,14 +374,16 @@ class NepalYPScraper(BaseScraper):
                 
                 # Extract ALL phone numbers
                 # Handles both "tel:number" AND "tel: number"
+                # Also handles dashes and spaces in phone numbers (e.g., 041-527496)
                 phones = await page.evaluate('''() => {
                     const links = document.querySelectorAll('a[href^="tel"]');
                     const nums = new Set();
                     for (const a of links) {
                         const t = a.textContent.trim();
-                        // Must be at least 7 digits
-                        if (t && /\\d{7,}/.test(t)) {
-                            nums.add(t);
+                        // Remove spaces and dashes, then check if at least 7 digits
+                        const digitsOnly = t.replace(/[\\s-]/g, '');
+                        if (digitsOnly && /^\\d{7,}$/.test(digitsOnly)) {
+                            nums.add(t);  // Keep original format with dashes
                         }
                     }
                     return [...nums].join(", ");

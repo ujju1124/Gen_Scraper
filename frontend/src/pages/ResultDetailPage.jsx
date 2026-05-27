@@ -9,6 +9,87 @@ import { StatusBadge } from '../components/StatusBadge'
 import { ProgressBar } from '../components/ProgressBar'
 import { MapView } from '../components/MapView'
 
+// Opening hours display - handles both plain strings and JSON objects
+function OpeningHoursDisplay({ value }) {
+  if (!value) return <p className="mt-1 text-sm text-slate-500">Not available</p>
+
+  // Try to parse as JSON object (Go scraper stores as JSON)
+  let parsed = null
+  if (typeof value === 'object' && value !== null) {
+    parsed = value
+  } else if (typeof value === 'string') {
+    try { parsed = JSON.parse(value) } catch (_) {}
+  }
+
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length > 0) {
+    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long' })
+    return (
+      <div className="mt-1 grid grid-cols-1 sm:grid-cols-2 gap-1">
+        {days.map(day => {
+          const hours = parsed[day] || parsed[day.toLowerCase()]
+          if (!hours) return null
+          const isToday = day === today
+          return (
+            <div key={day} className={`flex justify-between text-xs px-2 py-1 rounded ${isToday ? 'bg-primary-50 font-semibold text-primary-800' : 'text-slate-700'}`}>
+              <span className="w-24">{day}</span>
+              <span>{hours}</span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  // Plain string
+  return <p className="mt-1 text-sm text-slate-900">{String(value)}</p>
+}
+
+// Compact collapsible reviews component
+function ReviewsSection({ reviews }) {
+  const [expanded, setExpanded] = useState(false)
+  const PREVIEW_COUNT = 3
+  const shown = expanded ? reviews : reviews.slice(0, PREVIEW_COUNT)
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <label className="text-sm font-medium text-slate-700">
+          Recent Reviews ({reviews.length})
+        </label>
+        {reviews.length > PREVIEW_COUNT && (
+          <button
+            onClick={() => setExpanded(prev => !prev)}
+            className="text-xs text-primary-600 hover:text-primary-800 font-medium"
+          >
+            {expanded ? 'Show less' : `Show all ${reviews.length}`}
+          </button>
+        )}
+      </div>
+      <div className="space-y-2">
+        {shown.map((review, idx) => (
+          <div key={idx} className="bg-slate-50 rounded-lg p-3">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="font-medium text-xs text-slate-900">{review.Name || 'Anonymous'}</span>
+              {review.Rating > 0 && (
+                <span className="text-yellow-500 text-xs">{review.Rating} ⭐</span>
+              )}
+              {review.Date && (
+                <span className="text-xs text-slate-400 ml-auto">{review.Date}</span>
+              )}
+            </div>
+            {review.Description && (
+              <p className="text-xs text-slate-600 leading-relaxed line-clamp-3">
+                {review.Description}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export function ResultDetailPage() {
   const { id } = useParams()
   const navigate = useNavigate()
@@ -18,7 +99,7 @@ export function ResultDetailPage() {
 
   // Category-specific field groups
   const CATEGORY_FIELDS = {
-    hotels: ['name', 'brand', 'property_type', 'star_rating', 'address', 'street_address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'price_min', 'price_max', 'currency', 'includes_breakfast', 'rating_overall', 'review_count', 'rating_cleanliness', 'rating_location', 'rating_facilities', 'amenities', 'pets_allowed', 'checkin_time', 'checkout_time'],
+    hotels: ['name', 'brand', 'property_type', 'star_rating', 'address', 'street_address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'price_min', 'price_max', 'currency', 'includes_breakfast', 'rating_overall', 'review_count', 'rating_cleanliness', 'rating_location', 'rating_facilities', 'amenities', 'pets_allowed', 'checkin_time', 'checkout_time', 'opening_hours'],
     restaurants: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'price_min', 'price_max', 'currency', 'rating_overall', 'review_count', 'cuisine_type', 'opening_hours', 'amenities'],
     pharmacies: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'opening_hours', 'description_short'],
     hospitals: ['name', 'address', 'city', 'district', 'latitude', 'longitude', 'phone_primary', 'phone_secondary', 'email', 'website', 'description_short', 'amenities'],
@@ -407,9 +488,9 @@ export function ResultDetailPage() {
               </div>
             )}
             {shouldDisplayField('opening_hours', categoryName) && (
-              <div>
+              <div className="md:col-span-2">
                 <label className="text-sm font-medium text-slate-700">Opening Hours</label>
-                <p className="mt-1 text-sm text-slate-900">{formatValue(result.opening_hours)}</p>
+                <OpeningHoursDisplay value={result.opening_hours} />
               </div>
             )}
             {shouldDisplayField('pets_allowed', categoryName) && (
@@ -462,6 +543,22 @@ export function ResultDetailPage() {
             </p>
           </div>
           <div>
+            <label className="text-sm font-medium text-slate-700">Scraper Source</label>
+            <div className="mt-1">
+              {result.scraper_source ? (
+                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                  result.scraper_source === 'go_scraper' 
+                    ? 'bg-green-100 text-green-800' 
+                    : 'bg-blue-100 text-blue-800'
+                }`}>
+                  {result.scraper_source === 'go_scraper' ? '⚡ Go Scraper' : '🎭 ' + result.scraper_source}
+                </span>
+              ) : (
+                <span className="text-sm text-slate-500">Unknown</span>
+              )}
+            </div>
+          </div>
+          <div>
             <label className="text-sm font-medium text-slate-700">Edited</label>
             <p className="mt-1 text-sm text-slate-900">{formatBoolean(result.is_edited)}</p>
           </div>
@@ -487,6 +584,239 @@ export function ResultDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Photos Section - Show for all results with images */}
+      {result && result.scraper_source === 'go_scraper' && result.image_urls && result.image_urls.length > 0 && (
+        <div className="card p-6">
+          <h2 className="text-lg font-semibold text-slate-900 mb-4">
+            Photos ({result.image_urls.length})
+          </h2>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+            {result.image_urls.map((url, idx) => {
+              // Use proxy for Google Maps images to bypass CORS
+              const proxyUrl = `/api/v1/images/proxy?url=${encodeURIComponent(url)}`
+              
+              return (
+                <div key={url}>
+                  <a href={url} target="_blank" rel="noopener noreferrer">
+                    <img
+                      src={proxyUrl}
+                      alt={`Photo ${idx + 1}`}
+                      className="w-full h-32 object-cover rounded-lg shadow-sm hover:opacity-90 transition-opacity"
+                    />
+                  </a>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Rich Data Section - Go Scraper Only */}
+      {result && result.scraper_source === 'go_scraper' && result.extra_data && Object.keys(result.extra_data).length > 0 && (
+        <>
+          <div className="card p-6">
+            <h2 className="text-lg font-semibold text-slate-900 mb-4">
+              📍 Additional Information (Go Scraper)
+            </h2>
+            
+            <div className="space-y-6">
+              {/* Google Maps IDs */}
+              {(result.extra_data.place_id || result.extra_data.data_id || result.extra_data.cid) && (
+                <div>
+                  <label className="text-sm font-medium text-slate-700 mb-2 block">Google Maps Identifiers</label>
+                  <div className="bg-slate-50 rounded-lg p-4 space-y-2">
+                    {result.extra_data.place_id && (
+                      <div className="flex items-start gap-2">
+                        <span className="text-xs font-medium text-slate-500 w-24">Place ID:</span>
+                        <span className="text-xs text-slate-900 font-mono break-all">{result.extra_data.place_id}</span>
+                      </div>
+                    )}
+                    {result.extra_data.data_id && (
+                      <div className="flex items-start gap-2">
+                        <span className="text-xs font-medium text-slate-500 w-24">Data ID:</span>
+                        <span className="text-xs text-slate-900 font-mono break-all">{result.extra_data.data_id}</span>
+                      </div>
+                    )}
+                    {result.extra_data.cid && (
+                      <div className="flex items-start gap-2">
+                        <span className="text-xs font-medium text-slate-500 w-24">CID:</span>
+                        <span className="text-xs text-slate-900 font-mono break-all">{result.extra_data.cid}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Reviews Breakdown */}
+              {result.extra_data.reviews_per_rating && (() => {
+                try {
+                  const reviewsBreakdown = JSON.parse(result.extra_data.reviews_per_rating);
+                  const totalReviews = Object.values(reviewsBreakdown).reduce((a, b) => a + b, 0);
+                  return (
+                    <div>
+                      <label className="text-sm font-medium text-slate-700 mb-2 block">Reviews Breakdown</label>
+                      <div className="space-y-2">
+                        {[5, 4, 3, 2, 1].map(stars => {
+                          const count = reviewsBreakdown[stars] || 0;
+                          const percentage = totalReviews > 0 ? (count / totalReviews) * 100 : 0;
+                          return (
+                            <div key={stars} className="flex items-center gap-3">
+                              <span className="text-sm text-slate-600 w-12">{stars} ⭐</span>
+                              <div className="flex-1 bg-slate-200 rounded-full h-3">
+                                <div 
+                                  className="bg-yellow-400 h-3 rounded-full transition-all" 
+                                  style={{width: `${percentage}%`}}
+                                />
+                              </div>
+                              <span className="text-sm text-slate-600 w-16 text-right">{count.toLocaleString()}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                } catch (e) {
+                  return null;
+                }
+              })()}
+
+              {/* User Reviews - compact, collapsible */}
+              {result.extra_data.user_reviews && (() => {
+                try {
+                  const reviews = JSON.parse(result.extra_data.user_reviews);
+                  if (reviews && reviews.length > 0) {
+                    return (
+                      <ReviewsSection reviews={reviews} />
+                    );
+                  }
+                } catch (e) {
+                  return null;
+                }
+              })()}
+
+              {/* Complete Address */}
+              {result.extra_data.complete_address && (() => {
+                try {
+                  const addr = JSON.parse(result.extra_data.complete_address);
+                  const parts = [addr.street, addr.borough, addr.city, addr.postal_code, addr.state, addr.country].filter(Boolean);
+                  if (parts.length > 0) {
+                    return (
+                      <div>
+                        <label className="text-sm font-medium text-slate-700 mb-2 block">Complete Address</label>
+                        <p className="text-sm text-slate-900 bg-slate-50 rounded-lg p-3">
+                          {parts.join(', ')}
+                        </p>
+                      </div>
+                    );
+                  }
+                } catch (e) {
+                  return null;
+                }
+              })()}
+
+              {/* About/Description */}
+              {result.extra_data.about && (
+                <div>
+                  <label className="text-sm font-medium text-slate-700 mb-2 block">About</label>
+                  <p className="text-sm text-slate-700 leading-relaxed bg-slate-50 rounded-lg p-3">
+                    {result.extra_data.about}
+                  </p>
+                </div>
+              )}
+
+              {/* Booking Links */}
+              {(result.extra_data.reservations || result.extra_data.order_online || result.extra_data.menu) && (
+                <div>
+                  <label className="text-sm font-medium text-slate-700 mb-3 block">Quick Actions</label>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {result.extra_data.reservations && result.extra_data.reservations !== 'null' && (
+                      <a 
+                        href={result.extra_data.reservations} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="flex items-center justify-center gap-2 px-4 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
+                      >
+                        <span>📅</span>
+                        <span className="font-medium">Make Reservation</span>
+                      </a>
+                    )}
+                    {result.extra_data.order_online && result.extra_data.order_online !== 'null' && (
+                      <a 
+                        href={result.extra_data.order_online} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="flex items-center justify-center gap-2 px-4 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                      >
+                        <span>🛒</span>
+                        <span className="font-medium">Order Online</span>
+                      </a>
+                    )}
+                    {result.extra_data.menu && (() => {
+                      try {
+                        const menu = JSON.parse(result.extra_data.menu);
+                        if (menu.link && menu.link !== '') {
+                          return (
+                            <a 
+                              href={menu.link} 
+                              target="_blank" 
+                              rel="noopener noreferrer"
+                              className="flex items-center justify-center gap-2 px-4 py-3 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors"
+                            >
+                              <span>📋</span>
+                              <span className="font-medium">View Menu</span>
+                            </a>
+                          );
+                        }
+                      } catch (e) {
+                        return null;
+                      }
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              {/* Owner Information */}
+              {(result.extra_data.owner_name || result.extra_data.owner_id) && (
+                <div>
+                  <label className="text-sm font-medium text-slate-700 mb-2 block">Owner Information</label>
+                  <div className="bg-slate-50 rounded-lg p-3 space-y-1">
+                    {result.extra_data.owner_name && (
+                      <p className="text-sm text-slate-900">
+                        <span className="font-medium">Name:</span> {result.extra_data.owner_name}
+                      </p>
+                    )}
+                    {result.extra_data.owner_id && (
+                      <p className="text-sm text-slate-900">
+                        <span className="font-medium">ID:</span> {result.extra_data.owner_id}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Additional Metadata */}
+              {(result.extra_data.timezone || result.extra_data.plus_code) && (
+                <div>
+                  <label className="text-sm font-medium text-slate-700 mb-2 block">Additional Details</label>
+                  <div className="bg-slate-50 rounded-lg p-3 space-y-1">
+                    {result.extra_data.timezone && (
+                      <p className="text-sm text-slate-900">
+                        <span className="font-medium">Timezone:</span> {result.extra_data.timezone}
+                      </p>
+                    )}
+                    {result.extra_data.plus_code && (
+                      <p className="text-sm text-slate-900">
+                        <span className="font-medium">Plus Code:</span> {result.extra_data.plus_code}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   )
 }

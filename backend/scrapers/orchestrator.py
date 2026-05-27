@@ -153,7 +153,7 @@ class ScraperOrchestrator:
         Load sources for the job.
         
         If job.source_ids is specified, load only those sources.
-        Otherwise, load all active sources for the job's category.
+        If job.source_ids is empty/None, load NO category-specific sources.
         
         Always appends Google Maps as universal source when active.
         
@@ -164,24 +164,29 @@ class ScraperOrchestrator:
         Returns:
             List of Source instances
         """
-        query = db.query(Source).filter(
-            Source.is_active == True,
-            Source.category_id == job.category_id
-        )
+        sources = []
         
-        # Filter by specific source IDs if provided
+        # Only load category-specific sources if source_ids is explicitly provided
         if job.source_ids:
-            query = query.filter(Source.id.in_(job.source_ids))
-        
-        sources = query.all()
-        
-        logger.debug(
-            "orchestrator.sources_query",
-            job_id=job.id,
-            category_id=job.category_id,
-            source_ids=job.source_ids,
-            found_count=len(sources)
-        )
+            sources = db.query(Source).filter(
+                Source.is_active == True,
+                Source.category_id == job.category_id,
+                Source.id.in_(job.source_ids)
+            ).all()
+            
+            logger.debug(
+                "orchestrator.sources_query",
+                job_id=job.id,
+                category_id=job.category_id,
+                source_ids=job.source_ids,
+                found_count=len(sources)
+            )
+        else:
+            logger.info(
+                "orchestrator.no_sources_selected",
+                job_id=job.id,
+                message="No sources selected - will run only Google Maps"
+            )
         
         # Always add Google Maps as universal source when active
         google_maps_source = db.query(Source).filter(
@@ -307,9 +312,19 @@ class ScraperOrchestrator:
                 
                 # Run scraper (pass location and max_results from job) with timeout
                 try:
+                    # Adjust timeout based on scraper type
+                    # Directory of Nepal needs more time due to detail page fetching per listing
+                    # Google Maps Go scraper needs time for deep crawling
+                    if "directoryofnepal" in source.name:
+                        timeout_seconds = 1800.0  # 30 minutes for Directory of Nepal
+                    elif source.name == "google_maps":
+                        timeout_seconds = 1200.0  # 20 minutes for Google Maps
+                    else:
+                        timeout_seconds = 900.0   # 15 minutes for all other scrapers (Booking.com etc.)
+                    
                     source_results = await asyncio.wait_for(
                         scraper.run(source, db, job.location, max_results=max_results, category_id=job.category_id),
-                        timeout=300.0  # 5 minutes per scraper (increased from 180s)
+                        timeout=timeout_seconds
                     )
                 except asyncio.TimeoutError:
                     logger.error(
@@ -317,7 +332,7 @@ class ScraperOrchestrator:
                         job_id=job.id,
                         source_id=source.id,
                         source_name=source.name,
-                        timeout_seconds=300
+                        timeout_seconds=timeout_seconds
                     )
                     failed_source_ids.append(source.id)
                     continue

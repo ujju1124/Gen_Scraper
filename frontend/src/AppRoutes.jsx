@@ -13,6 +13,7 @@ import { JobStatusPage } from './pages/JobStatusPage'
 import { JobResultsPage } from './pages/JobResultsPage'
 import { ResultDetailPage } from './pages/ResultDetailPage'
 import { AdminPage } from './pages/AdminPage'
+import { ValidatedResultsPage } from './pages/ValidatedResultsPage'
 import { SourceManagerPage } from './pages/SourceManagerPage'
 import { UserManagementPage } from './pages/UserManagementPage'
 import { MonitoringDashboard } from './pages/MonitoringDashboard'
@@ -71,6 +72,18 @@ export function AppRoutes() {
             <RoleGuard>
               <Layout>
                 <AdminPage />
+              </Layout>
+            </RoleGuard>
+          </AuthGuard>
+        }
+      />
+      <Route
+        path="/validated"
+        element={
+          <AuthGuard>
+            <RoleGuard>
+              <Layout>
+                <ValidatedResultsPage />
               </Layout>
             </RoleGuard>
           </AuthGuard>

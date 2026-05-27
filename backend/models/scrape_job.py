@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, ARRAY
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func, text
 from database import Base
 
@@ -21,3 +21,15 @@ class ScrapeJob(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # Go scraper settings — stored per job for Google Maps source
+    # e.g. {"geo_coordinates": "27.693444,85.281924", "zoom": 14, "max_depth": 20, "radius": 5}
+    google_maps_settings = Column(JSONB, nullable=True)
+    
+    # Job statistics — stored after job completion
+    # e.g. {"raw_scraped": 95, "new_records": 10, "duplicates": 85, "by_source": {1: 75, 32: 20}}
+    statistics = Column(JSONB, nullable=True)
+    
+    # Scraping progress — updated during job execution for live progress display
+    # e.g. "🔍 Searching Google Maps...", "✅ Google Maps complete - 30 hotels found"
+    scraping_progress = Column(String, nullable=True)

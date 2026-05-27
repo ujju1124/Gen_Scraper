@@ -23,11 +23,24 @@ logger = structlog.get_logger()
 
 
 # Request/Response schemas
+class GoogleMapsSettings(BaseModel):
+    """Settings specific to Google Maps scraper (Go microservice)"""
+    geo_coordinates: Optional[str] = None  # "lat,lon" e.g. "27.693444,85.281924"
+    zoom: Optional[int] = 14  # Map zoom level (1-21)
+    max_depth: Optional[int] = 20  # Scroll depth / pagination depth
+    radius: Optional[float] = 0  # Search radius in km (0 = no limit)
+    lang: Optional[str] = "en"  # Language code
+    extract_emails: Optional[bool] = False  # Extract emails from websites
+    extra_reviews: Optional[bool] = False  # Fetch extended reviews
+    fast_mode: Optional[bool] = False  # Use fast HTTP mode
+
+
 class CreateJobRequest(BaseModel):
     category_id: int
     location: str
     source_ids: Optional[List[int]] = None
     max_results: Optional[int] = None  # None = scrape all; integer = cap per source
+    google_maps_settings: Optional[GoogleMapsSettings] = None  # Settings for Google Maps scraper
 
 
 class JobResponse(BaseModel):
@@ -55,6 +68,8 @@ class JobStatusResponse(BaseModel):
     started_at: Optional[str]
     completed_at: Optional[str]
     result_count: Optional[int]
+    statistics: Optional[dict] = None  # Scraping statistics (raw_scraped, new_records, duplicates, by_source_name)
+    scraping_progress: Optional[str] = None  # Live progress message during scraping
 
 
 class CleanedResultResponse(BaseModel):
@@ -67,6 +82,11 @@ class CleanedResultResponse(BaseModel):
     currency: Optional[str]
     data_completeness: Optional[float]
     status: str
+    scraper_source: Optional[str] = None  # Optional - older results may not have this
+    thumbnail_url: Optional[str] = None  # For displaying images
+    latitude: Optional[float] = None  # For map display
+    longitude: Optional[float] = None  # For map display
+    phone_primary: Optional[str] = None  # For map popup
     created_at: str
     # Phase 6A — merge fields
     merged_from_sources: Optional[List[int]] = None
@@ -117,6 +137,7 @@ async def create_job(
         location=job_request.location,
         source_ids=job_request.source_ids,
         max_results=job_request.max_results,
+        google_maps_settings=job_request.google_maps_settings.model_dump() if job_request.google_maps_settings else None,
         status="QUEUED"
     )
     
@@ -250,7 +271,9 @@ def get_job_status(
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-        "result_count": result_count
+        "result_count": result_count,
+        "statistics": job.statistics,  # Include statistics if available
+        "scraping_progress": job.scraping_progress  # Include live progress message
     }
 
 
@@ -293,33 +316,42 @@ async def stream_job_status(
                     logger.info("sse.client_disconnected", job_id=str(job_id))
                     break
                 
-                # Refresh job status from database
-                db.refresh(job)
+                # Re-query job from database instead of refresh to avoid session detachment issues
+                current_job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+                
+                if not current_job:
+                    logger.error("sse.job_not_found", job_id=str(job_id))
+                    break
                 
                 # Prepare event data
                 event_data = {
-                    "status": job.status,
-                    "started_at": job.started_at.isoformat() if job.started_at else None,
-                    "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                    "status": current_job.status,
+                    "started_at": current_job.started_at.isoformat() if current_job.started_at else None,
+                    "completed_at": current_job.completed_at.isoformat() if current_job.completed_at else None,
+                    "scraping_progress": current_job.scraping_progress,  # Add live progress
                 }
                 
                 # Add result count if done
-                if job.status == "DONE":
+                if current_job.status == "DONE":
                     result_count = db.query(func.count(CleanedResult.id)).filter(
                         CleanedResult.job_id == job_id
                     ).scalar()
                     event_data["result_count"] = result_count
+                    
+                    # Add statistics if available
+                    if current_job.statistics:
+                        event_data["statistics"] = current_job.statistics
                 
                 # Add error message if failed
-                if job.status == "FAILED":
-                    event_data["error"] = job.error_message
+                if current_job.status == "FAILED":
+                    event_data["error"] = current_job.error_message
                 
                 # Yield SSE event with proper formatting
                 event_message = f"event: status\ndata: {json.dumps(event_data)}\n\n"
                 yield event_message
                 
                 # Break if job is done or failed
-                if job.status in ("DONE", "FAILED"):
+                if current_job.status in ("DONE", "FAILED"):
                     # Send final event to signal completion
                     yield ": complete\n\n"
                     break
@@ -410,6 +442,11 @@ def get_job_results(
             "currency": result.currency,
             "data_completeness": float(result.data_completeness) if result.data_completeness else None,
             "status": result.status,
+            "scraper_source": result.scraper_source,
+            "thumbnail_url": result.thumbnail_url,
+            "latitude": float(result.latitude) if result.latitude else None,
+            "longitude": float(result.longitude) if result.longitude else None,
+            "phone_primary": result.phone_primary,
             "created_at": result.created_at.isoformat() if result.created_at else None
         })
     
@@ -536,4 +573,111 @@ def get_result_detail(
             detail="Result not found"
         )
     
-    return result
+    # Explicitly serialize to ensure JSONB fields are properly converted
+    return {
+        "id": str(result.id),
+        "job_id": str(result.job_id),
+        "source_id": result.source_id,
+        "category_id": result.category_id,
+        "dedup_key": result.dedup_key,
+        # Identity
+        "name": result.name,
+        "brand": result.brand,
+        "property_type": result.property_type,
+        "star_rating": result.star_rating,
+        # Location
+        "address": result.address,
+        "street_address": result.street_address,
+        "city": result.city,
+        "district": result.district,
+        "province": result.province,
+        "country": result.country,
+        "latitude": float(result.latitude) if result.latitude else None,
+        "longitude": float(result.longitude) if result.longitude else None,
+        "neighbourhood": result.neighbourhood,
+        "nearby_landmark": result.nearby_landmark,
+        # Contact
+        "phone_primary": result.phone_primary,
+        "phone_secondary": result.phone_secondary,
+        "email": result.email,
+        "website": result.website,
+        "facebook_url": result.facebook_url,
+        "instagram_handle": result.instagram_handle,
+        "whatsapp_number": result.whatsapp_number,
+        # Pricing
+        "price_min": float(result.price_min) if result.price_min else None,
+        "price_max": float(result.price_max) if result.price_max else None,
+        "currency": result.currency,
+        "price_range_label": result.price_range_label,
+        "includes_breakfast": result.includes_breakfast,
+        "includes_taxes": result.includes_taxes,
+        # Reviews
+        "rating_overall": float(result.rating_overall) if result.rating_overall else None,
+        "rating_label": result.rating_label,
+        "review_count": result.review_count,
+        "rating_cleanliness": float(result.rating_cleanliness) if result.rating_cleanliness else None,
+        "rating_location": float(result.rating_location) if result.rating_location else None,
+        "rating_facilities": float(result.rating_facilities) if result.rating_facilities else None,
+        "rating_service": float(result.rating_service) if result.rating_service else None,
+        "rating_value": float(result.rating_value) if result.rating_value else None,
+        # Facilities
+        "amenities": result.amenities or [],
+        "pets_allowed": result.pets_allowed,
+        "breakfast_available": result.breakfast_available,
+        "checkin_time": result.checkin_time,
+        "checkout_time": result.checkout_time,
+        "cancellation_policy": result.cancellation_policy,
+        "free_cancellation": result.free_cancellation,
+        # Media
+        "thumbnail_url": result.thumbnail_url,
+        "image_urls": result.image_urls or [],
+        "image_count": result.image_count,
+        # Content
+        "description_short": result.description_short,
+        "description_full": result.description_full,
+        "highlights": result.highlights or [],
+        "popular_with": result.popular_with or [],
+        "staff_languages": result.staff_languages or [],
+        # Business Info
+        "opening_hours": result.opening_hours,
+        "established_year": result.established_year,
+        # Metadata
+        "source_url": result.source_url,
+        "source_listing_id": result.source_listing_id,
+        "data_completeness": float(result.data_completeness) if result.data_completeness else None,
+        "is_edited": result.is_edited,
+        "is_duplicate": result.is_duplicate,
+        "status": result.status,
+        "scraper_source": result.scraper_source,
+        "extra_data": result.extra_data or {},
+        "created_at": result.created_at.isoformat() if result.created_at else None,
+        "updated_at": result.updated_at.isoformat() if result.updated_at else None,
+        # Merge tracking
+        "merged_from_sources": result.merged_from_sources or [],
+        "confidence_score": float(result.confidence_score) if result.confidence_score else None,
+        "merged_at": result.merged_at.isoformat() if result.merged_at else None,
+    }
+
+
+
+@router.get("/go-scraper/queue")
+async def get_go_scraper_queue_status(
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get Go scraper pool queue status for monitoring.
+    
+    Returns:
+        - Total instances (4)
+        - Healthy instances count
+        - Total pending/working/completed/failed across all instances
+        - Per-instance status breakdown
+    
+    Requires authentication but no admin role.
+    """
+    from scrapers.go_scraper_pool import go_scraper_pool
+    
+    # Get status from all instances in the pool
+    pool_status = await go_scraper_pool.get_all_queue_status()
+    
+    return pool_status

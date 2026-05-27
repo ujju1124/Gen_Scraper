@@ -27,10 +27,17 @@ class Settings(BaseSettings):
     # Scraper settings
     MOCK_MODE: bool = False
     
+    # Go scraper microservice settings
+    GO_SCRAPER_URL: str = "http://go_scraper:8080"
+    GO_SCRAPER_API_KEY: str = ""
+    GO_SCRAPER_ENABLED: bool = True
+    GO_SCRAPER_TIMEOUT: int = 600   # seconds to wait for Go job to complete (10 minutes including queue wait)
+    GO_SCRAPER_POLL_INTERVAL: int = 5  # seconds between status polls
+    
     # Detail page scraping settings
-    MAX_DETAIL_PAGES_PER_JOB: int = 10
-    DETAIL_PAGE_DELAY_MIN: int = 3000  # milliseconds
-    DETAIL_PAGE_DELAY_MAX: int = 6000  # milliseconds
+    MAX_DETAIL_PAGES_PER_JOB: int = 0  # Set to 0 or None for unlimited, or positive number to limit
+    DETAIL_PAGE_DELAY_MIN: int = 1000  # milliseconds (reduced from 3000 to 1000)
+    DETAIL_PAGE_DELAY_MAX: int = 2000  # milliseconds (reduced from 6000 to 2000)
     
     # Geocoding settings
     GEOCODING_ENABLED: bool = True

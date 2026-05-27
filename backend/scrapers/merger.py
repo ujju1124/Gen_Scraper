@@ -1,676 +1,475 @@
 """
-MergingPipeline — Phase 6A + Phase 7 Priority 3
+Merging Pipeline for Web Scraping Portal
 
-Runs after CleaningPipeline completes for a job. Groups cleaned_results by
-dedup_key and merges records from multiple sources into one canonical record,
-filling NULL fields from lower-priority sources using field-specific rules.
+This module merges results from multiple sources to create enriched records.
+When the same business appears in multiple sources (e.g., Booking.com + Google Maps),
+it combines the data to create a single record with the best information from all sources.
 
-Phase 7 Priority 3 adds fuzzy matching to improve merge rate from 5% to 30-50%:
-- Fuzzy name matching (80% similarity threshold with transliteration + normalization)
-- Phone number normalization and matching
-- Coordinate proximity matching (50m radius)
+Strategy:
+1. Group results by dedup_key (same business from different sources)
+2. For each group, merge fields using priority rules
+3. Update one result as "master" with merged data
+4. Mark others as duplicates (is_duplicate=TRUE)
+5. Track source_ids in merged_from_sources array
+6. Calculate confidence_score based on number of sources
 """
-import uuid
-import re
-import difflib
-from datetime import datetime, timezone
-from decimal import Decimal
-from collections import defaultdict
-from typing import Optional
-from math import radians, sin, cos, sqrt, atan2
 
 import structlog
+from typing import List, Dict, Any, Optional
+from decimal import Decimal
+from datetime import datetime
 from sqlalchemy.orm import Session
-from unidecode import unidecode
+from sqlalchemy import func
 
 from models.cleaned_result import CleanedResult
-from models.source import Source
 
 logger = structlog.get_logger()
 
-# Source priority: index 0 = highest priority
-SOURCE_PRIORITY = [
-    "booking_com",
-    "directoryofnepal_hotels",
-    "directoryofnepal_restaurants",
-    "directoryofnepal_pharmacies",
-    "nepalyp",
-    "nepalyp_restaurants",
-    "nepalyp_pharmacies",
-    "nepalyp_hospitals",
-]
-
-# Same 14 key fields as CleaningPipeline
-KEY_FIELDS = [
-    "name", "address", "city", "phone_primary", "email", "website",
-    "rating_overall", "review_count", "thumbnail_url", "description_short",
-    "amenities", "price_min", "latitude", "longitude",
-]
-
-# Known placeholder/default coordinates that should NOT be used for fuzzy matching
-# These are typically city/district centroids used when accurate GPS data is unavailable
-PLACEHOLDER_COORDS = [
-    (27.7172000, 85.3240000),  # Thamel district centroid, Kathmandu
-    # Add more as discovered during data quality checks
-]
-
 
 class MergingPipeline:
+    """
+    Merges results from multiple sources to create enriched records.
+    
+    Merging Rules:
+    - Prefer non-null values over null
+    - Prefer higher data_completeness scores
+    - Prefer Go scraper for rich fields (opening_hours, extra_data)
+    - Prefer Booking.com/Agoda for pricing and amenities
+    - Combine arrays (amenities, image_urls)
+    - Average numeric values (ratings) if different
+    """
+    
+    # Source priority for different field types
+    PRICE_SOURCES = ["booking_com", "agoda", "tripadvisor"]  # Best for pricing
+    RICH_DATA_SOURCES = ["google_maps"]  # Best for opening hours, reviews, images
+    CONTACT_SOURCES = ["nepalyp", "directoryofnepal"]  # Best for phone, email
+    
     def __init__(self, db: Session):
-        self.db = db
-        self._source_name_cache: dict[int, str] = {}
-
-    def _normalize_phone(self, phone: Optional[str]) -> Optional[str]:
         """
-        Normalize phone number by stripping all non-digits.
-        Handles Nepal country code (977) normalization.
+        Initialize the merging pipeline.
         
         Args:
-            phone: Raw phone number string
+            db: SQLAlchemy database session
+        """
+        self.db = db
+    
+    def run(self, job_id: str) -> Dict[str, int]:
+        """
+        Run merging pipeline for all results in a job.
+        
+        Args:
+            job_id: UUID of the scrape job
             
         Returns:
-            Normalized phone number (digits only) or None
-            
-        Examples:
-            "+977-1-4411234" -> "14411234"
-            "977-1-4411234" -> "14411234"
-            "01-4411234" -> "14411234"
-            "(01) 4411234" -> "14411234"
+            Dictionary with merge statistics:
+            - merged_groups: Number of groups that were merged
+            - total_records_processed: Total number of records processed
+            - master_records: Number of master records created
+            - duplicate_records: Number of records marked as duplicates
         """
-        if not phone:
+        logger.info("merger.started", job_id=job_id)
+        
+        # Load all cleaned results for this job
+        results = self.db.query(CleanedResult).filter(
+            CleanedResult.job_id == job_id
+        ).all()
+        
+        if not results:
+            logger.info("merger.no_results", job_id=job_id)
+            return {
+                "merged_groups": 0,
+                "total_records_processed": 0,
+                "master_records": 0,
+                "duplicate_records": 0
+            }
+        
+        logger.info(
+            "merger.results_loaded",
+            job_id=job_id,
+            result_count=len(results)
+        )
+        
+        # Group results by dedup_key
+        groups = self._group_by_dedup_key(results)
+        
+        logger.info(
+            "merger.groups_created",
+            job_id=job_id,
+            total_results=len(results),
+            unique_groups=len(groups),
+            multi_source_groups=sum(1 for g in groups.values() if len(g) > 1)
+        )
+        
+        # Merge each group
+        merged_groups = 0
+        master_records = 0
+        duplicate_records = 0
+        
+        for dedup_key, group_results in groups.items():
+            if len(group_results) > 1:
+                # Multiple sources for same business — merge them
+                master, duplicates = self._merge_group(group_results)
+                merged_groups += 1
+                master_records += 1
+                duplicate_records += len(duplicates)
+                
+                logger.debug(
+                    "merger.group_merged",
+                    job_id=job_id,
+                    dedup_key=dedup_key[:16],
+                    source_count=len(group_results),
+                    master_id=str(master.id),
+                    master_sources=master.merged_from_sources,
+                    confidence=float(master.confidence_score) if master.confidence_score else None
+                )
+        
+        # Commit all changes
+        self.db.commit()
+        
+        stats = {
+            "merged_groups": merged_groups,
+            "total_records_processed": len(results),
+            "master_records": master_records,
+            "duplicate_records": duplicate_records
+        }
+        
+        logger.info(
+            "merger.completed",
+            job_id=job_id,
+            **stats
+        )
+        
+        return stats
+    
+    def _group_by_dedup_key(self, results: List[CleanedResult]) -> Dict[str, List[CleanedResult]]:
+        """
+        Group results by dedup_key.
+        
+        Args:
+            results: List of CleanedResult objects
+            
+        Returns:
+            Dictionary mapping dedup_key to list of results
+        """
+        groups = {}
+        
+        for result in results:
+            if result.dedup_key:
+                if result.dedup_key not in groups:
+                    groups[result.dedup_key] = []
+                groups[result.dedup_key].append(result)
+        
+        return groups
+    
+    def _merge_group(self, group: List[CleanedResult]) -> tuple[CleanedResult, List[CleanedResult]]:
+        """
+        Merge a group of results from different sources.
+        
+        Strategy:
+        1. Choose master record (highest completeness)
+        2. Merge fields from all sources into master
+        3. Mark others as duplicates
+        4. Set merged_from_sources and confidence_score
+        
+        Args:
+            group: List of CleanedResult objects with same dedup_key
+            
+        Returns:
+            Tuple of (master_record, duplicate_records)
+        """
+        # Sort by data_completeness (highest first)
+        sorted_group = sorted(
+            group,
+            key=lambda r: r.data_completeness or 0,
+            reverse=True
+        )
+        
+        # Choose master (highest completeness)
+        master = sorted_group[0]
+        duplicates = sorted_group[1:]
+        
+        # Collect source IDs
+        source_ids = [r.source_id for r in group]
+        
+        # Merge fields from all sources
+        for result in group:
+            if result.id == master.id:
+                continue  # Skip master itself
+            
+            # Merge each field using priority rules
+            master = self._merge_fields(master, result)
+        
+        # Set merge metadata
+        master.merged_from_sources = source_ids
+        master.confidence_score = self._calculate_confidence(len(source_ids))
+        master.merged_at = datetime.utcnow()
+        
+        # Mark duplicates
+        for dup in duplicates:
+            dup.is_duplicate = True
+        
+        return master, duplicates
+    
+    def _merge_fields(self, master: CleanedResult, source: CleanedResult) -> CleanedResult:
+        """
+        Merge fields from source into master using priority rules.
+        
+        Rules:
+        - Prefer non-null over null
+        - Prefer higher completeness for text fields
+        - Combine arrays (amenities, image_urls)
+        - Average numeric values if both present
+        - Prefer specific sources for specific fields
+        
+        Args:
+            master: Master record to merge into
+            source: Source record to merge from
+            
+        Returns:
+            Updated master record
+        """
+        # Get source names for priority decisions
+        master_source = self._get_source_name(master.source_id)
+        source_source = self._get_source_name(source.source_id)
+        
+        # Identity fields (prefer non-null)
+        master.brand = master.brand or source.brand
+        master.property_type = master.property_type or source.property_type
+        master.star_rating = master.star_rating or source.star_rating
+        
+        # Location fields (prefer non-null, prefer longer addresses)
+        if not master.address or (source.address and len(source.address) > len(master.address)):
+            master.address = source.address
+        master.street_address = master.street_address or source.street_address
+        master.district = master.district or source.district
+        master.province = master.province or source.province
+        master.neighbourhood = master.neighbourhood or source.neighbourhood
+        master.nearby_landmark = master.nearby_landmark or source.nearby_landmark
+        
+        # Coordinates (prefer non-null, prefer Go scraper)
+        if not master.latitude and source.latitude:
+            master.latitude = source.latitude
+            master.longitude = source.longitude
+        elif source_source == "google_maps" and source.latitude:
+            # Override with Google Maps coordinates (more accurate)
+            master.latitude = source.latitude
+            master.longitude = source.longitude
+        
+        # Contact fields (prefer non-null, prefer contact-focused sources)
+        if not master.phone_primary or source_source in self.CONTACT_SOURCES:
+            master.phone_primary = master.phone_primary or source.phone_primary
+        master.phone_secondary = master.phone_secondary or source.phone_secondary
+        master.email = master.email or source.email
+        
+        # Website (prefer non-null)
+        master.website = master.website or source.website
+        master.facebook_url = master.facebook_url or source.facebook_url
+        master.instagram_handle = master.instagram_handle or source.instagram_handle
+        master.whatsapp_number = master.whatsapp_number or source.whatsapp_number
+        
+        # Pricing (prefer price-focused sources like Booking.com)
+        if not master.price_min or source_source in self.PRICE_SOURCES:
+            master.price_min = master.price_min or source.price_min
+            master.price_max = master.price_max or source.price_max
+            master.price_range_label = master.price_range_label or source.price_range_label
+        master.includes_breakfast = master.includes_breakfast or source.includes_breakfast
+        master.includes_taxes = master.includes_taxes or source.includes_taxes
+        
+        # Reviews (average if both present, otherwise prefer non-null)
+        if master.rating_overall and source.rating_overall:
+            # Average ratings
+            master.rating_overall = (master.rating_overall + source.rating_overall) / 2
+        else:
+            master.rating_overall = master.rating_overall or source.rating_overall
+        
+        master.rating_label = master.rating_label or source.rating_label
+        
+        # Review count (sum if both present)
+        if master.review_count and source.review_count:
+            master.review_count = master.review_count + source.review_count
+        else:
+            master.review_count = master.review_count or source.review_count
+        
+        # Detailed ratings (average if both present)
+        for rating_field in ['rating_cleanliness', 'rating_location', 'rating_facilities', 
+                             'rating_service', 'rating_value']:
+            master_val = getattr(master, rating_field)
+            source_val = getattr(source, rating_field)
+            if master_val and source_val:
+                setattr(master, rating_field, (master_val + source_val) / 2)
+            else:
+                setattr(master, rating_field, master_val or source_val)
+        
+        # Facilities (combine arrays)
+        master.amenities = self._merge_json_arrays(master.amenities, source.amenities)
+        master.pets_allowed = master.pets_allowed or source.pets_allowed
+        master.breakfast_available = master.breakfast_available or source.breakfast_available
+        master.checkin_time = master.checkin_time or source.checkin_time
+        master.checkout_time = master.checkout_time or source.checkout_time
+        master.cancellation_policy = master.cancellation_policy or source.cancellation_policy
+        master.free_cancellation = master.free_cancellation or source.free_cancellation
+        
+        # Media (combine arrays, prefer higher count)
+        master.thumbnail_url = master.thumbnail_url or source.thumbnail_url
+        master.image_urls = self._merge_json_arrays(master.image_urls, source.image_urls)
+        if master.image_count and source.image_count:
+            master.image_count = max(master.image_count, source.image_count)
+        else:
+            master.image_count = master.image_count or source.image_count
+        
+        # Content (prefer longer descriptions)
+        if not master.description_short or (source.description_short and 
+                                            len(source.description_short) > len(master.description_short or "")):
+            master.description_short = source.description_short
+        if not master.description_full or (source.description_full and 
+                                           len(source.description_full) > len(master.description_full or "")):
+            master.description_full = source.description_full
+        
+        master.highlights = self._merge_json_arrays(master.highlights, source.highlights)
+        master.popular_with = self._merge_json_arrays(master.popular_with, source.popular_with)
+        master.staff_languages = self._merge_json_arrays(master.staff_languages, source.staff_languages)
+        
+        # Business info (prefer Go scraper for opening hours)
+        if not master.opening_hours or source_source in self.RICH_DATA_SOURCES:
+            master.opening_hours = master.opening_hours or source.opening_hours
+        master.established_year = master.established_year or source.established_year
+        
+        # Metadata
+        master.source_url = master.source_url or source.source_url
+        master.source_listing_id = master.source_listing_id or source.source_listing_id
+        
+        # Go scraper fields (prefer Go scraper)
+        if source_source == "google_maps" or not master.scraper_source:
+            master.scraper_source = source.scraper_source or master.scraper_source
+        
+        # Merge extra_data (combine dictionaries)
+        if source.extra_data:
+            if not master.extra_data:
+                master.extra_data = source.extra_data
+            else:
+                # Merge dictionaries (source values override master if present)
+                master.extra_data = {**master.extra_data, **source.extra_data}
+        
+        # Recalculate completeness after merge
+        master.data_completeness = self._recalculate_completeness(master)
+        
+        return master
+    
+    def _merge_json_arrays(self, master_array: Any, source_array: Any) -> Any:
+        """
+        Merge two JSON arrays, removing duplicates.
+        
+        Args:
+            master_array: Master array (list or None)
+            source_array: Source array (list or None)
+            
+        Returns:
+            Merged array with unique values
+        """
+        if not master_array and not source_array:
             return None
         
-        # Strip all non-digits
-        digits = re.sub(r'\D', '', phone)
+        if not master_array:
+            return source_array
         
-        # Normalize Nepal numbers: strip country code 977 if present
-        if digits.startswith('977') and len(digits) > 10:
-            digits = digits[3:]
+        if not source_array:
+            return master_array
         
-        # Strip leading zero from local Nepal numbers (01-xxx becomes 1-xxx)
-        if digits.startswith('0') and len(digits) >= 8:
-            digits = digits[1:]
+        # Ensure both are lists
+        if not isinstance(master_array, list):
+            master_array = [master_array]
+        if not isinstance(source_array, list):
+            source_array = [source_array]
         
-        # Return None if too short to be valid
-        return digits if len(digits) >= 7 else None
-
-    def _is_placeholder_coordinate(self, lat: float, lon: float) -> bool:
+        # Combine and remove duplicates (preserve order)
+        seen = set()
+        merged = []
+        for item in master_array + source_array:
+            # Convert to string for comparison (handles dicts, strings, etc.)
+            item_str = str(item)
+            if item_str not in seen:
+                seen.add(item_str)
+                merged.append(item)
+        
+        return merged if merged else None
+    
+    def _calculate_confidence(self, source_count: int) -> Decimal:
         """
-        Check if a coordinate is a known placeholder/default coordinate.
+        Calculate confidence score based on number of sources.
         
-        Placeholder coordinates are typically city/district centroids used by
-        data sources when accurate GPS data is unavailable. These should NOT
-        be used for fuzzy matching as they cause false positives.
+        Formula:
+        - 1 source: 0.50 (low confidence)
+        - 2 sources: 0.75 (medium confidence)
+        - 3+ sources: 0.90 (high confidence)
         
         Args:
-            lat: Latitude (can be Decimal or float)
-            lon: Longitude (can be Decimal or float)
+            source_count: Number of sources that provided this business
             
         Returns:
-            True if coordinate is a known placeholder, False otherwise
-            
-        Example:
-            _is_placeholder_coordinate(27.7172000, 85.3240000) -> True (Thamel centroid)
+            Confidence score (0.00-1.00)
         """
-        # Convert Decimal to float if needed
-        lat_float = float(lat) if lat is not None else None
-        lon_float = float(lon) if lon is not None else None
+        if source_count >= 3:
+            return Decimal("0.90")
+        elif source_count == 2:
+            return Decimal("0.75")
+        else:
+            return Decimal("0.50")
+    
+    def _recalculate_completeness(self, result: CleanedResult) -> Decimal:
+        """
+        Recalculate data completeness after merging.
         
-        if lat_float is None or lon_float is None:
-            return False
+        Uses same 14 key fields as CleaningPipeline.
         
-        for plat, plon in PLACEHOLDER_COORDS:
-            # Use 0.0001 degree tolerance (~11 meters)
-            if abs(lat_float - plat) < 0.0001 and abs(lon_float - plon) < 0.0001:
-                return True
-        return False
-
-    def _transliterate_name(self, name: str) -> str:
-        """Convert any script (Devanagari/Nepali etc.) to Latin characters."""
-        if not name:
-            return ""
-        return ' '.join(unidecode(name).lower().split())
-
-    def _normalize_business_name(self, name: str) -> str:
-        """Remove common prefixes/suffixes to get core name."""
-        if not name:
-            return ""
-        normalized = name.lower().strip()
-        prefixes = ['the ', 'hotel ', 'resort ', 'guest house ', 'restaurant ']
-        suffixes = [
-            ' hotel', ' resort', ' guest house', ' pvt. ltd.', ' pvt ltd',
-            ' ltd.', ' ltd', ' & spa', ' and spa', ' inn', ' lodge',
-            ' restaurant', ' cafe', ' pharmacy', ' hospital', ' clinic'
+        Args:
+            result: CleanedResult object
+            
+        Returns:
+            Completeness percentage (0.00-100.00)
+        """
+        key_fields = [
+            "name", "address", "city", "phone_primary", "email", "website",
+            "rating_overall", "review_count", "thumbnail_url", "description_short",
+            "amenities", "price_min", "latitude", "longitude"
         ]
-        for prefix in prefixes:
-            if normalized.startswith(prefix):
-                normalized = normalized[len(prefix):]
-                break
-        for suffix in suffixes:
-            if normalized.endswith(suffix):
-                normalized = normalized[:-len(suffix)]
-                break
-        return ' '.join(normalized.split())
-
-    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        
+        non_null_count = 0
+        for field in key_fields:
+            value = getattr(result, field, None)
+            if value is not None:
+                if isinstance(value, str) and value.strip():
+                    non_null_count += 1
+                elif not isinstance(value, str):
+                    non_null_count += 1
+        
+        completeness = (non_null_count / len(key_fields)) * 100
+        
+        # Bonus for Go scraper extra_data
+        if result.extra_data and isinstance(result.extra_data, dict):
+            bonus_fields = ["place_id", "open_hours", "user_reviews", "images",
+                            "complete_address", "popular_times"]
+            bonus_count = sum(1 for f in bonus_fields if result.extra_data.get(f))
+            completeness = min(100.0, completeness + (bonus_count * 1.5))
+        
+        return Decimal(str(round(completeness, 2)))
+    
+    def _get_source_name(self, source_id: int) -> str:
         """
-        Calculate distance in kilometers between two coordinates using Haversine formula.
+        Get source name from source_id.
         
         Args:
-            lat1, lon1: First coordinate
-            lat2, lon2: Second coordinate
+            source_id: ID of the source
             
         Returns:
-            Distance in kilometers
-            
-        Example:
-            _haversine_distance(27.7172, 85.3240, 27.7180, 85.3250) -> ~0.12 km
+            Source name (e.g., "booking_com", "google_maps")
         """
-        R = 6371  # Earth radius in kilometers
+        # Cache source names to avoid repeated queries
+        if not hasattr(self, '_source_cache'):
+            self._source_cache = {}
         
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
+        if source_id not in self._source_cache:
+            from models.source import Source
+            source = self.db.query(Source).filter(Source.id == source_id).first()
+            self._source_cache[source_id] = source.name if source else "unknown"
         
-        a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-        c = 2 * atan2(sqrt(a), sqrt(1-a))
-        
-        return R * c
-
-    def _are_same_business(self, record_a: CleanedResult, record_b: CleanedResult) -> bool:
-        """
-        Determine if two records represent the same business using fuzzy matching.
-        
-        Matching criteria (any one triggers a match):
-        1. Same phone number (after normalization)
-        2. Coordinates within 50 meters
-        3. Name similarity >= 85%
-        
-        Safety checks (prevent false positives):
-        - Must be in same city
-        - Must be from different sources
-        
-        Args:
-            record_a, record_b: Two CleanedResult records to compare
-            
-        Returns:
-            True if records represent the same business, False otherwise
-        """
-        # Safety check: Must be same city
-        if record_a.city and record_b.city:
-            if record_a.city.lower().strip() != record_b.city.lower().strip():
-                return False
-        
-        # Safety check: Never merge records from same source
-        if record_a.source_id == record_b.source_id:
-            return False
-        
-        # Criterion 1: Phone match (strongest signal)
-        phone_a = self._normalize_phone(record_a.phone_primary)
-        phone_b = self._normalize_phone(record_b.phone_primary)
-        if phone_a and phone_b and phone_a == phone_b:
-            logger.debug(
-                "merger.fuzzy_match_phone",
-                record_a_id=str(record_a.id),
-                record_b_id=str(record_b.id),
-                phone=phone_a
-            )
-            return True
-        
-        # Criterion 2: Coordinate proximity match (within 50 meters)
-        # CRITICAL: Skip coordinate matching if either record has a placeholder coordinate
-        # to prevent false positives from city/district centroids
-        if all([record_a.latitude, record_a.longitude, record_b.latitude, record_b.longitude]):
-            # Check for placeholder coordinates first
-            if self._is_placeholder_coordinate(record_a.latitude, record_a.longitude) or \
-               self._is_placeholder_coordinate(record_b.latitude, record_b.longitude):
-                # Skip coordinate matching for placeholder coordinates
-                logger.debug(
-                    "merger.skipped_placeholder_coordinate",
-                    record_a_id=str(record_a.id),
-                    record_b_id=str(record_b.id),
-                    coord_a=f"({record_a.latitude}, {record_a.longitude})",
-                    coord_b=f"({record_b.latitude}, {record_b.longitude})"
-                )
-            else:
-                # Calculate distance for non-placeholder coordinates
-                distance_km = self._haversine_distance(
-                    record_a.latitude, record_a.longitude,
-                    record_b.latitude, record_b.longitude
-                )
-                if distance_km <= 0.05:  # 50 meters = 0.05 km
-                    # CRITICAL: Names must be at least 80% similar to prevent merging
-                    # different businesses at the same location (e.g., in same building)
-                    name_a = self._normalize_business_name(
-                        self._transliterate_name(record_a.name)
-                    )
-                    name_b = self._normalize_business_name(
-                        self._transliterate_name(record_b.name)
-                    )
-                    if name_a and name_b:
-                        similarity = difflib.SequenceMatcher(None, name_a, name_b).ratio()
-                        if similarity >= 0.80:  # 80% threshold (same as name-only matching)
-                            logger.debug(
-                                "merger.fuzzy_match_coordinates_with_name",
-                                record_a_id=str(record_a.id),
-                                record_b_id=str(record_b.id),
-                                distance_meters=round(distance_km * 1000, 1),
-                                name_similarity=round(similarity, 3)
-                            )
-                            return True
-                    # Don't merge if names are too different (likely different businesses at same location)
-                    logger.debug(
-                        "merger.skipped_coordinate_match_low_name_similarity",
-                        record_a_id=str(record_a.id),
-                        record_b_id=str(record_b.id),
-                        distance_meters=round(distance_km * 1000, 1),
-                        name_a=record_a.name,
-                        name_b=record_b.name
-                    )
-        
-        # Criterion 3: Name fuzzy match with transliteration + normalization (80% similarity threshold)
-        if record_a.name and record_b.name:
-            name_a = self._normalize_business_name(
-                self._transliterate_name(record_a.name)
-            )
-            name_b = self._normalize_business_name(
-                self._transliterate_name(record_b.name)
-            )
-            if name_a and name_b:
-                similarity = difflib.SequenceMatcher(None, name_a, name_b).ratio()
-                if similarity >= 0.80:
-                    logger.debug(
-                        "merger.fuzzy_match_name",
-                        record_a_id=str(record_a.id),
-                        record_b_id=str(record_b.id),
-                        name_a=record_a.name,
-                        name_b=record_b.name,
-                        normalized_a=name_a,
-                        normalized_b=name_b,
-                        similarity=round(similarity, 3)
-                    )
-                    return True
-        
-        return False
-
-    def run_cross_job(self) -> dict:
-        """
-        Cross-job merging pipeline. Groups ALL non-duplicate records across ALL jobs
-        by dedup_key and source, then fuzzy-matches remaining unmatched records.
-
-        This is the fix for the 0.25% merge rate bug where merging only ran within
-        single jobs instead of across jobs from different sources.
-
-        Returns:
-            {"merged_groups": N, "total_records_processed": M, "fuzzy_merged_groups": K}
-        """
-        logger.info("merger.cross_job_pass_starting")
-
-        # ===== PASS 1: Exact dedup_key matching across ALL jobs ===== #
-        # Get all non-duplicate records across every job
-        all_results = self.db.query(CleanedResult).filter(
-            CleanedResult.is_duplicate == False,
-        ).all()
-
-        logger.info("merger.cross_job_records_loaded", total=len(all_results))
-
-        # Group by dedup_key → source_id (one canonical per source per business)
-        dedup_groups: dict[str, dict[int, CleanedResult]] = defaultdict(dict)
-        for r in all_results:
-            if r.dedup_key:
-                if r.source_id not in dedup_groups[r.dedup_key]:
-                    dedup_groups[r.dedup_key][r.source_id] = r
-
-        exact_merged_groups = 0
-        for dedup_key, source_map in dedup_groups.items():
-            if len(source_map) < 2:
-                continue
-            group = list(source_map.values())
-            self._merge_group(group)
-            exact_merged_groups += 1
-
-        self.db.flush()
-        logger.info("merger.cross_job_exact_pass_complete", exact_merged_groups=exact_merged_groups)
-
-        # ===== PASS 2: Fuzzy matching across ALL jobs ===== #
-        non_merged = self.db.query(CleanedResult).filter(
-            CleanedResult.is_duplicate == False,
-            CleanedResult.merged_from_sources == None,
-        ).all()
-
-        logger.info("merger.cross_job_fuzzy_pass_starting", non_merged_count=len(non_merged))
-
-        fuzzy_groups = []
-        processed_ids = set()
-
-        for record in non_merged:
-            if record.id in processed_ids:
-                continue
-            group = [record]
-            processed_ids.add(record.id)
-
-            for other in non_merged:
-                if other.id in processed_ids:
-                    continue
-                if self._are_same_business(record, other):
-                    group.append(other)
-                    processed_ids.add(other.id)
-
-            if len(group) >= 2:
-                fuzzy_groups.append(group)
-
-        fuzzy_merged_groups = 0
-        for group in fuzzy_groups:
-            self._merge_group(group)
-            fuzzy_merged_groups += 1
-            logger.info(
-                "merger.cross_job_fuzzy_group_merged",
-                group_size=len(group),
-                source_ids=[r.source_id for r in group],
-            )
-
-        self.db.commit()
-
-        total_merged_groups = exact_merged_groups + fuzzy_merged_groups
-        logger.info(
-            "merger.cross_job_complete",
-            exact_merged_groups=exact_merged_groups,
-            fuzzy_merged_groups=fuzzy_merged_groups,
-            total_merged_groups=total_merged_groups,
-            total_records_processed=len(all_results),
-        )
-
-        return {
-            "merged_groups": total_merged_groups,
-            "exact_merged_groups": exact_merged_groups,
-            "fuzzy_merged_groups": fuzzy_merged_groups,
-            "total_records_processed": len(all_results),
-        }
-
-    def run(self, job_id: str) -> dict:
-        """
-        Entry point. Performs two-pass merging:
-        1. Exact dedup_key matching (existing logic)
-        2. Fuzzy matching for remaining non-merged records (Priority 3)
-        
-        Returns:
-            {"merged_groups": N, "total_records_processed": M, "fuzzy_merged_groups": K}
-        """
-        job_uuid = uuid.UUID(job_id) if isinstance(job_id, str) else job_id
-
-        # Query ALL records for this job (including cross-job duplicates)
-        # We group by dedup_key+source_id to find the same hotel from different sources
-        all_results = self.db.query(CleanedResult).filter(
-            CleanedResult.job_id == job_uuid,
-        ).all()
-
-        # ===== PASS 1: Exact dedup_key matching ===== #
-        # Group by dedup_key, then sub-group by source_id (one record per source per hotel)
-        # We want to merge when the same hotel (dedup_key) appears from multiple sources
-        dedup_groups: dict[str, dict[int, CleanedResult]] = defaultdict(dict)
-        for r in all_results:
-            if r.dedup_key:
-                # Keep the first record per source per dedup_key (lowest is_duplicate priority)
-                if r.source_id not in dedup_groups[r.dedup_key]:
-                    dedup_groups[r.dedup_key][r.source_id] = r
-
-        exact_merged_groups = 0
-        for dedup_key, source_map in dedup_groups.items():
-            if len(source_map) < 2:
-                logger.debug("merger.skipped", dedup_key=dedup_key)
-                continue
-            # Multiple sources have this hotel — merge them
-            group = list(source_map.values())
-            self._merge_group(group)
-            exact_merged_groups += 1
-
-        logger.info(
-            "merger.exact_pass_complete",
-            job_id=job_id,
-            exact_merged_groups=exact_merged_groups,
-        )
-
-        # ===== PASS 2: Fuzzy matching for remaining non-merged records ===== #
-        # Get records that weren't merged in pass 1 and aren't marked as duplicates
-        non_merged = self.db.query(CleanedResult).filter(
-            CleanedResult.job_id == job_uuid,
-            CleanedResult.is_duplicate == False,
-            CleanedResult.merged_from_sources == None
-        ).all()
-
-        logger.info(
-            "merger.fuzzy_pass_starting",
-            job_id=job_id,
-            non_merged_count=len(non_merged)
-        )
-
-        # Group by fuzzy matching
-        fuzzy_groups = []
-        processed_ids = set()
-
-        for record in non_merged:
-            if record.id in processed_ids:
-                continue
-
-            # Start a new group with this record
-            group = [record]
-            processed_ids.add(record.id)
-
-            # Find similar records from different sources
-            for other in non_merged:
-                if other.id in processed_ids:
-                    continue
-                if self._are_same_business(record, other):
-                    group.append(other)
-                    processed_ids.add(other.id)
-
-            # Only merge if we found matches from multiple sources
-            if len(group) >= 2:
-                fuzzy_groups.append(group)
-
-        # Merge fuzzy groups
-        fuzzy_merged_groups = 0
-        for group in fuzzy_groups:
-            self._merge_group(group)
-            fuzzy_merged_groups += 1
-            logger.info(
-                "merger.fuzzy_group_merged",
-                group_size=len(group),
-                source_ids=[r.source_id for r in group]
-            )
-
-        total_merged_groups = exact_merged_groups + fuzzy_merged_groups
-
-        logger.info(
-            "merger.complete",
-            job_id=job_id,
-            exact_merged_groups=exact_merged_groups,
-            fuzzy_merged_groups=fuzzy_merged_groups,
-            total_merged_groups=total_merged_groups,
-            total_records_processed=len(all_results),
-        )
-        
-        return {
-            "merged_groups": total_merged_groups,
-            "exact_merged_groups": exact_merged_groups,
-            "fuzzy_merged_groups": fuzzy_merged_groups,
-            "total_records_processed": len(all_results)
-        }
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
-
-    def _source_name(self, source_id: int) -> str:
-        if source_id not in self._source_name_cache:
-            src = self.db.query(Source).filter(Source.id == source_id).first()
-            self._source_name_cache[source_id] = src.name if src else ""
-        return self._source_name_cache[source_id]
-
-    def _priority(self, record: CleanedResult) -> int:
-        name = self._source_name(record.source_id)
-        try:
-            return SOURCE_PRIORITY.index(name)
-        except ValueError:
-            return len(SOURCE_PRIORITY)
-
-    def _pick_canonical(self, records: list[CleanedResult]) -> CleanedResult:
-        return min(records, key=self._priority)
-
-    def _merge_group(self, group: list[CleanedResult]) -> None:
-        canonical = self._pick_canonical(group)
-        others = [r for r in group if r.id != canonical.id]
-
-        self._merge_fields(canonical, others)
-        # Store only DISTINCT source IDs (not duplicates)
-        canonical.merged_from_sources = sorted(list(set(r.source_id for r in group)))
-        canonical.merged_at = datetime.now(timezone.utc)
-        canonical.confidence_score = self._calculate_confidence(group, canonical)
-        canonical.data_completeness = Decimal(str(self._recalculate_completeness(canonical)))
-
-        for r in others:
-            r.is_duplicate = True
-
-        self.db.commit()
-
-        logger.info(
-            "merger.merged",
-            dedup_key=canonical.dedup_key,
-            source_count=len(group),
-            canonical_source_id=canonical.source_id,
-            confidence_score=float(canonical.confidence_score),
-        )
-
-    def _merge_fields(self, canonical: CleanedResult, others: list[CleanedResult]) -> None:
-        """Fill NULL fields in canonical from others using field-specific rules."""
-        all_records = [canonical] + others  # canonical first = highest priority
-
-        # --- Simple priority fields: use first non-null value ---
-        simple_fields = [
-            "name", "brand", "property_type", "star_rating",
-            "address", "street_address", "city", "district", "province",
-            "country", "latitude", "longitude", "neighbourhood", "nearby_landmark",
-            "website", "facebook_url", "instagram_handle", "whatsapp_number",
-            "currency", "price_range_label",
-            "rating_label", "rating_cleanliness", "rating_location",
-            "rating_facilities", "rating_service", "rating_value",
-            "checkin_time", "checkout_time", "cancellation_policy",
-            "thumbnail_url",
-        ]
-        for field in simple_fields:
-            if getattr(canonical, field) is None:
-                for r in others:
-                    val = getattr(r, field)
-                    if val is not None:
-                        setattr(canonical, field, val)
-                        break
-
-        # --- Phone: first unique phone → phone_primary, second → phone_secondary ---
-        phones: list[str] = []
-        for r in all_records:
-            for attr in ("phone_primary", "phone_secondary"):
-                val = getattr(r, attr)
-                if val and val not in phones:
-                    phones.append(val)
-        canonical.phone_primary = phones[0] if len(phones) > 0 else canonical.phone_primary
-        canonical.phone_secondary = phones[1] if len(phones) > 1 else canonical.phone_secondary
-        # Any phones[2+] are discarded per requirements
-
-        # --- Email: highest-priority source with a non-null email ---
-        if canonical.email is None:
-            for r in others:
-                if r.email:
-                    canonical.email = r.email
-                    break
-
-        # --- Rating: source with highest review_count wins ---
-        best_review_count = canonical.review_count or 0
-        for r in others:
-            rc = r.review_count or 0
-            if rc > best_review_count:
-                best_review_count = rc
-                canonical.rating_overall = r.rating_overall
-                canonical.review_count = r.review_count
-        if canonical.rating_overall is None:
-            for r in others:
-                if r.rating_overall is not None:
-                    canonical.rating_overall = r.rating_overall
-                    canonical.review_count = r.review_count
-                    break
-
-        # --- Price: min of price_min, max of price_max ---
-        all_mins = [r.price_min for r in all_records if r.price_min is not None]
-        all_maxs = [r.price_max for r in all_records if r.price_max is not None]
-        if all_mins:
-            canonical.price_min = min(all_mins)
-        if all_maxs:
-            canonical.price_max = max(all_maxs)
-
-        # --- Boolean: TRUE wins ---
-        for field in ("pets_allowed", "includes_breakfast", "includes_taxes",
-                      "breakfast_available", "free_cancellation"):
-            if not getattr(canonical, field):
-                for r in others:
-                    if getattr(r, field):
-                        setattr(canonical, field, True)
-                        break
-
-        # --- Descriptions: longest non-null value ---
-        for field in ("description_short", "description_full"):
-            current = getattr(canonical, field) or ""
-            for r in others:
-                val = getattr(r, field) or ""
-                if len(val) > len(current):
-                    current = val
-            setattr(canonical, field, current or None)
-
-        # --- Arrays: merge + deduplicate (case-insensitive) ---
-        for field in ("amenities", "highlights", "popular_with", "staff_languages", "image_urls"):
-            merged: list = []
-            seen_lower: set = set()
-            for r in all_records:
-                items = getattr(r, field) or []
-                for item in items:
-                    key = str(item).lower()
-                    if key not in seen_lower:
-                        seen_lower.add(key)
-                        merged.append(item)
-            setattr(canonical, field, merged if merged else None)
-
-        # --- image_count: max ---
-        counts = [r.image_count for r in all_records if r.image_count is not None]
-        if counts:
-            canonical.image_count = max(counts)
-
-    def _calculate_confidence(
-        self, records: list[CleanedResult], canonical: CleanedResult
-    ) -> Decimal:
-        n = len(records)
-        source_score = min(n / 3.0, 1.0)
-        completeness_score = float(canonical.data_completeness or 0) / 100.0
-        agreement_score = self._calculate_agreement(records)
-        score = source_score * 0.4 + completeness_score * 0.4 + agreement_score * 0.2
-        return Decimal(str(round(score, 2)))
-
-    def _calculate_agreement(self, records: list[CleanedResult]) -> float:
-        """Fraction of non-null shared fields where all sources agree."""
-        if len(records) < 2:
-            return 1.0
-        check_fields = ["name", "city", "address", "rating_overall"]
-        agree = total = 0
-        for field in check_fields:
-            vals = [getattr(r, field) for r in records if getattr(r, field) is not None]
-            if len(vals) >= 2:
-                total += 1
-                if len(set(str(v).lower().strip() for v in vals)) == 1:
-                    agree += 1
-        return agree / total if total > 0 else 1.0
-
-    def _recalculate_completeness(self, record: CleanedResult) -> float:
-        non_null = 0
-        for field in KEY_FIELDS:
-            val = getattr(record, field, None)
-            if val is not None:
-                if isinstance(val, str) and not val.strip():
-                    continue
-                non_null += 1
-        return round((non_null / len(KEY_FIELDS)) * 100, 2)
+        return self._source_cache[source_id]

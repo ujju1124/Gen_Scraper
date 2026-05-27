@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, Text, DateTime, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func, text
 from database import Base
 
@@ -15,3 +16,6 @@ class ValidatedResult(Base):
     validated_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     validated_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     notes = Column(Text, nullable=True)
+    
+    # Relationships
+    cleaned_result = relationship("CleanedResult", foreign_keys=[cleaned_result_id])

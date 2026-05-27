@@ -1,8 +1,13 @@
 """
-Google Maps Scraper Implementation
+Google Maps Scraper — Go-first with Playwright fallback
 
-Universal background source that automatically runs for every scraping job,
-providing comprehensive business data with near 100% coordinate coverage.
+Scraping strategy (in order):
+  1. Go scraper microservice (port 8080) — 33+ fields, fast, rich data
+  2. Playwright fallback — original browser-based scraper (12 fields)
+
+The Go scraper is tried first. If it's unreachable, disabled, or returns 0
+results, the Playwright-based scraper runs as a fallback so no job ever fails
+silently.
 """
 
 import re
@@ -10,24 +15,327 @@ import structlog
 from typing import Optional
 from sqlalchemy.orm import Session
 
+from config import settings
 from models.source import Source
 from scrapers.base_scraper import BaseScraper
+from scrapers.go_scraper_client import GoScraperClient
 
 logger = structlog.get_logger()
+
+# City → geo_coordinates lookup for common Nepal cities
+# Used when the job doesn't supply explicit coordinates
+CITY_COORDINATES = {
+    "kathmandu":  "27.693444,85.281924",
+    "pokhara":    "28.209538,83.985567",
+    "lalitpur":   "27.666667,85.316667",
+    "bhaktapur":  "27.671667,85.428889",
+    "chitwan":    "27.529722,84.354167",
+    "bharatpur":  "27.683333,84.433333",
+    "biratnagar": "26.455000,87.283333",
+    "birgunj":    "27.012222,84.877778",
+    "dharan":     "26.812222,87.283333",
+    "butwal":     "27.700556,83.448056",
+    "hetauda":    "27.426944,85.031944",
+    "janakpur":   "26.727778,85.926389",
+    "nepalgunj":  "28.050000,81.616667",
+    "dhangadhi":  "28.694444,80.594444",
+}
 
 
 class GoogleMapsScraper(BaseScraper):
     """
-    Scraper for Google Maps business listings.
-    
-    This is a universal source that runs automatically for all categories,
-    providing enrichment data with high-quality coordinates.
+    Google Maps scraper — Go microservice first, Playwright fallback.
+
+    This is the universal source that runs for all job categories.
     """
-    
-    def __init__(self):
+
+    def __init__(self, source_name: str = "google_maps"):
         super().__init__()
-        self.source_name = "google_maps"
-    
+        self.source_name = source_name
+        self._go_client = GoScraperClient()
+
+    async def run(
+        self,
+        source: Source,
+        db: Session,
+        location: str,
+        max_results: Optional[int] = None,
+        category_id: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Override BaseScraper.run() to try Go scraper before opening a browser.
+
+        Falls back to Playwright only if Go scraper is unavailable or returns 0.
+        """
+        logger.info(
+            "google_maps.run_start",
+            location=location,
+            max_results=max_results,
+            go_enabled=settings.GO_SCRAPER_ENABLED,
+        )
+
+        # ── Tier 1: Go scraper ──────────────────────────────────────────
+        if settings.GO_SCRAPER_ENABLED:
+            results = await self._run_go_scraper(
+                source, db, location, max_results, category_id
+            )
+            if results:
+                # Check if we got all requested results or just partial
+                got_all_results = not max_results or len(results) >= max_results
+                
+                if got_all_results:
+                    logger.info(
+                        "google_maps.go_scraper_succeeded",
+                        location=location,
+                        result_count=len(results),
+                        status="complete"
+                    )
+                    return results
+                else:
+                    # Got partial results - use Playwright to complete
+                    logger.warning(
+                        "google_maps.go_scraper_partial",
+                        location=location,
+                        partial_count=len(results),
+                        requested=max_results,
+                        message="Got partial results from Go scraper - using Playwright to complete"
+                    )
+                    # Store partial results to combine later
+                    go_scraper_results = results
+            else:
+                logger.warning(
+                    "google_maps.go_scraper_returned_empty",
+                    location=location,
+                    message="Falling back to Playwright scraper",
+                )
+                go_scraper_results = []
+
+        # ── Tier 2: Playwright fallback ─────────────────────────────────
+        logger.info("google_maps.playwright_fallback_start", location=location)
+        
+        # Update progress: Starting Playwright fallback
+        from models.scrape_job import ScrapeJob
+        job = db.query(ScrapeJob).filter(
+            ScrapeJob.location == location,
+            ScrapeJob.category_id == category_id,
+            ScrapeJob.status == "RUNNING"
+        ).order_by(ScrapeJob.started_at.desc()).first()
+        
+        if job:
+            if go_scraper_results:
+                job.scraping_progress = f"🌐 Completing with browser scraper ({len(go_scraper_results)} already found)..."
+            else:
+                job.scraping_progress = f"🌐 Using browser scraper for {location}..."
+            db.commit()
+            db.refresh(job)
+        
+        # Calculate remaining results needed
+        remaining_needed = None
+        if max_results and go_scraper_results:
+            remaining_needed = max(0, max_results - len(go_scraper_results))
+            logger.info(
+                "google_maps.playwright_remaining",
+                location=location,
+                already_have=len(go_scraper_results),
+                remaining_needed=remaining_needed
+            )
+        
+        playwright_results = await super().run(source, db, location, remaining_needed or max_results, category_id)
+        
+        # Combine results: Go scraper + Playwright
+        if go_scraper_results and playwright_results:
+            # Deduplicate by name+address to avoid duplicates
+            seen = set()
+            combined_results = []
+            
+            for result in go_scraper_results + playwright_results:
+                key = (result.get("name", "").lower(), result.get("address", "").lower())
+                if key not in seen and key != ("", ""):
+                    seen.add(key)
+                    combined_results.append(result)
+            
+            logger.info(
+                "google_maps.results_combined",
+                location=location,
+                go_scraper_count=len(go_scraper_results),
+                playwright_count=len(playwright_results),
+                combined_count=len(combined_results),
+                duplicates_removed=len(go_scraper_results) + len(playwright_results) - len(combined_results)
+            )
+            
+            results = combined_results
+        elif go_scraper_results:
+            results = go_scraper_results
+        else:
+            results = playwright_results
+        
+        # Update progress: Completed
+        if job and results:
+            job.scraping_progress = f"✅ Found {len(results)} results total"
+            db.commit()
+            db.refresh(job)
+        
+        return results
+
+    # ------------------------------------------------------------------
+    # Go scraper tier
+    # ------------------------------------------------------------------
+
+    async def _run_go_scraper(
+        self,
+        source: Source,
+        db: Session,
+        location: str,
+        max_results: Optional[int],
+        category_id: Optional[int],
+    ) -> list[dict]:
+        """Call the Go scraper API and return mapped results."""
+        # Resolve category name for keyword
+        category = await self._resolve_category(db, category_id)
+
+        # Build keyword
+        keyword = f"{category} in {location}"
+
+        # Try to get google_maps_settings from the current job
+        # The job is not directly passed, so we need to query it from the session
+        # We can identify the job by looking for a RUNNING job with this location and category
+        from models.scrape_job import ScrapeJob
+        job = db.query(ScrapeJob).filter(
+            ScrapeJob.location == location,
+            ScrapeJob.category_id == category_id,
+            ScrapeJob.status == "RUNNING"
+        ).order_by(ScrapeJob.started_at.desc()).first()
+
+        # Update progress: Starting Go scraper
+        if job:
+            job.scraping_progress = f"🔍 Searching Google Maps for {category} in {location}..."
+            db.commit()
+            db.refresh(job)  # Refresh to ensure the change is visible to other sessions
+
+        # Extract settings from job or use defaults
+        settings_dict = job.google_maps_settings if job and job.google_maps_settings else {}
+        
+        # Resolve geo_coordinates from settings or city name
+        geo_coordinates = settings_dict.get("geo_coordinates") or self._get_geo_coordinates(location)
+
+        # Derive max_depth from settings or max_results
+        # Dynamic formula: adjusts depth based on desired result count
+        max_depth = settings_dict.get("max_depth")
+        if max_depth is None:
+            if max_results:
+                # Dynamic formula based on max_results
+                # Each scroll/depth typically yields 5-15 results depending on location
+                # We use a conservative estimate of 8 results per depth
+                # Add 20% buffer to ensure we get enough results
+                
+                if max_results <= 20:
+                    # Small requests: 10-20 results
+                    # Formula: (results / 8) + 2 buffer
+                    max_depth = max(5, (max_results // 8) + 2)
+                elif max_results <= 50:
+                    # Medium requests: 21-50 results
+                    # Formula: (results / 8) + 3 buffer
+                    max_depth = (max_results // 8) + 3
+                elif max_results <= 100:
+                    # Large requests: 51-100 results
+                    # Formula: (results / 8) + 5 buffer
+                    max_depth = (max_results // 8) + 5
+                elif max_results <= 200:
+                    # Very large requests: 101-200 results
+                    # Formula: (results / 10) + 8 buffer
+                    max_depth = (max_results // 10) + 8
+                else:
+                    # Huge requests: 200+ results
+                    # Formula: (results / 10) + 10 buffer, capped at 100
+                    max_depth = min(100, (max_results // 10) + 10)
+                
+                logger.info(
+                    "google_maps.max_depth_calculated",
+                    max_results=max_results,
+                    max_depth=max_depth,
+                    estimated_results=max_depth * 8
+                )
+            else:
+                # For unlimited scraping (max_results=None), use high depth
+                # This will scrape 500-1000+ results depending on location
+                max_depth = 100
+                logger.info(
+                    "google_maps.max_depth_unlimited",
+                    max_depth=max_depth,
+                    estimated_results="500-1000+"
+                )
+
+        # Get other settings with defaults
+        zoom = settings_dict.get("zoom", 14)
+        radius = settings_dict.get("radius", 0)
+        lang = settings_dict.get("lang", "en")
+        extract_emails = settings_dict.get("extract_emails", False)
+        extra_reviews = settings_dict.get("extra_reviews", False)
+        fast_mode = settings_dict.get("fast_mode", False)
+
+        logger.info(
+            "google_maps.go_scraper_call",
+            keyword=keyword,
+            geo_coordinates=geo_coordinates,
+            max_depth=max_depth,
+            zoom=zoom,
+            radius=radius,
+            max_results=max_results,
+        )
+
+        results = await self._go_client.scrape(
+            keyword=keyword,
+            geo_coordinates=geo_coordinates,
+            zoom=zoom,
+            max_depth=max_depth,
+            radius=radius,
+            lang=lang,
+            extract_emails=extract_emails,
+            extra_reviews=extra_reviews,
+            fast_mode=fast_mode,
+        )
+
+        # Update progress: Go scraper completed
+        if job and results:
+            job.scraping_progress = f"✅ Google Maps found {len(results)} {category}"
+            db.commit()
+            db.refresh(job)  # Refresh to ensure the change is visible to other sessions
+        elif job and not results:
+            job.scraping_progress = "⚠️ Go scraper timed out, using Playwright fallback..."
+            db.commit()
+            db.refresh(job)  # Refresh to ensure the change is visible to other sessions
+
+        # Filter results by distance from target coordinates (if available)
+        original_count = len(results)
+        if geo_coordinates and results:
+            results = self._filter_by_distance(results, geo_coordinates, max_distance_km=50)
+            if len(results) < original_count:
+                logger.info(
+                    "google_maps.location_filtered",
+                    keyword=keyword,
+                    original_count=original_count,
+                    filtered_count=len(results),
+                    removed_count=original_count - len(results),
+                    max_distance_km=50,
+                )
+
+        # Inject city and source_id into each result
+        for r in results:
+            r["city"] = r.get("city_from_go") or location
+            r["source_id"] = source.id
+            # Remove internal helper key
+            r.pop("city_from_go", None)
+
+        # Trim to max_results if needed
+        if max_results and len(results) > max_results:
+            results = results[:max_results]
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Playwright fallback tier (original implementation)
+    # ------------------------------------------------------------------
+
     async def _scrape(
         self,
         page,
@@ -35,462 +343,307 @@ class GoogleMapsScraper(BaseScraper):
         db: Session,
         location: str,
         max_results: Optional[int] = None,
-        category_id: Optional[int] = None
+        category_id: Optional[int] = None,
     ) -> list[dict]:
         """
-        Scrape business listings from Google Maps.
-        
-        Args:
-            page: Playwright page object
-            source: Source model instance
-            db: SQLAlchemy database session
-            location: Location string (e.g., "Kathmandu")
-            max_results: Maximum results to collect (None = scrape until end)
-            category_id: Job's category ID — used to look up the category name
-            
-        Returns:
-            List of scraped business dictionaries
+        Original Playwright-based Google Maps scraper (fallback).
+        Returns 12 standard fields.
         """
         logger.info(
-            "google_maps.scrape_start",
+            "google_maps.playwright_scrape_start",
             location=location,
             max_results=max_results,
-            category_id=category_id
+            category_id=category_id,
         )
 
-        # Fix 1: Get category name from the job's category_id (passed from orchestrator)
-        # google_maps source has category_id=NULL (universal), so we use the job's category
-        category = 'businesses'  # default
+        category = await self._resolve_category(db, category_id)
+
+        search_query = f"{category} in {location}".replace(" ", "+")
+        search_url = f"https://www.google.com/maps/search/{search_query}/"
+
+        logger.info("google_maps.navigating", url=search_url, category=category)
+
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
+
+            if await self._detect_captcha(page):
+                logger.warning("google_maps.captcha_detected_early")
+                return []
+
+            result_urls = await self._scroll_and_collect_urls(page, max_results)
+
+            if not result_urls:
+                logger.warning("google_maps.no_results", location=location, category=category)
+                return []
+
+            logger.info("google_maps.urls_collected", count=len(result_urls))
+
+            results = await self._extract_from_detail_pages(
+                page, source, db, result_urls, location, category, max_results
+            )
+
+            # Tag as playwright source
+            for r in results:
+                r["scraper_source"] = "playwright"
+
+            logger.info(
+                "google_maps.playwright_scrape_complete",
+                location=location,
+                result_count=len(results),
+            )
+            return results
+
+        except Exception as e:
+            logger.error(
+                "google_maps.playwright_scrape_error",
+                location=location,
+                error=str(e),
+                exc_info=True,
+            )
+            await self._debug_page(page, "google_maps_error")
+            return []
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    async def _resolve_category(self, db: Session, category_id: Optional[int]) -> str:
+        """Resolve category name from category_id."""
+        category = "businesses"
         if category_id:
             try:
                 from models.category import Category
                 cat = db.query(Category).filter(Category.id == category_id).first()
                 if cat:
                     category = cat.name
-                    logger.info("google_maps.category_resolved", category=category, category_id=category_id)
             except Exception as e:
-                logger.warning("google_maps.category_lookup_failed", category_id=category_id, error=str(e))
+                logger.warning("google_maps.category_lookup_failed", error=str(e))
+        return category
+
+    @staticmethod
+    def _get_geo_coordinates(location: str) -> str:
+        """Return lat,lon string for a city name, or empty string if unknown."""
+        return CITY_COORDINATES.get(location.lower().strip(), "")
+
+    @staticmethod
+    def _filter_by_distance(results: list[dict], geo_coordinates: str, max_distance_km: float = 50) -> list[dict]:
+        """
+        Filter results by distance from target coordinates.
         
-        # Build search URL
-        search_query = f"{category} in {location}".replace(" ", "+")
-        search_url = f"https://www.google.com/maps/search/{search_query}/"
-        
-        logger.info(
-            "google_maps.navigating",
-            url=search_url,
-            category=category
-        )
+        Removes results that are more than max_distance_km away from the target.
+        Uses Haversine formula for distance calculation.
+        """
+        if not geo_coordinates or not results:
+            return results
         
         try:
-            # Navigate to search page
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)  # Wait for Google Maps to load
-            
-            # Check for CAPTCHA immediately
-            if await self._detect_captcha(page):
-                logger.warning("google_maps.captcha_detected_early")
-                return []
-            
-            # Collect result URLs by scrolling
-            result_urls = await self._scroll_and_collect_urls(page, max_results)
-            
-            if not result_urls:
-                logger.warning("google_maps.no_results", location=location, category=category)
-                return []
-            
-            logger.info(
-                "google_maps.urls_collected",
-                count=len(result_urls),
-                max_results=max_results
-            )
-            
-            # Extract data from each detail page
-            results = await self._extract_from_detail_pages(
-                page,
-                source,
-                db,
-                result_urls,
-                location,
-                category,
-                max_results
-            )
-            
-            logger.info(
-                "google_maps.scrape_complete",
-                location=location,
-                category=category,
-                result_count=len(results)
-            )
-            
+            target_lat, target_lon = map(float, geo_coordinates.split(","))
+        except (ValueError, AttributeError):
+            logger.warning("google_maps.invalid_geo_coordinates", geo_coordinates=geo_coordinates)
             return results
+        
+        from math import radians, sin, cos, sqrt, atan2
+        
+        def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+            """Calculate distance in km between two lat/lon points."""
+            R = 6371  # Earth radius in km
             
-        except Exception as e:
-            logger.error(
-                "google_maps.scrape_error",
-                location=location,
-                category=category,
-                error=str(e),
-                exc_info=True
-            )
-            await self._debug_page(page, "google_maps_error")
-            return []
-    
+            lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            
+            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1-a))
+            
+            return R * c
+        
+        filtered = []
+        for r in results:
+            lat = r.get("latitude")
+            lon = r.get("longitude")
+            
+            if lat is None or lon is None:
+                # Keep results without coordinates
+                filtered.append(r)
+                continue
+            
+            try:
+                distance = haversine_distance(target_lat, target_lon, float(lat), float(lon))
+                if distance <= max_distance_km:
+                    filtered.append(r)
+                else:
+                    logger.debug(
+                        "google_maps.result_filtered_by_distance",
+                        name=r.get("name", "")[:50],
+                        distance_km=round(distance, 2),
+                        max_distance_km=max_distance_km,
+                    )
+            except (ValueError, TypeError) as e:
+                # Keep results with invalid coordinates
+                logger.warning("google_maps.distance_calc_error", error=str(e), result=r.get("name", "")[:50])
+                filtered.append(r)
+        
+        return filtered
+
+    # ------------------------------------------------------------------
+    # Playwright helpers (unchanged from original)
+    # ------------------------------------------------------------------
+
     async def _scroll_and_collect_urls(
-        self,
-        page,
-        max_results: Optional[int]
+        self, page, max_results: Optional[int]
     ) -> list[str]:
-        """
-        Scroll the results sidebar and collect business detail page URLs.
-        
-        Args:
-            page: Playwright page object
-            max_results: Maximum URLs to collect
-            
-        Returns:
-            List of business detail page URLs
-        """
-        # Find scrollable results container
         feed_selector = '[role="feed"]'
-        
         try:
             await page.wait_for_selector(feed_selector, timeout=15000)
         except Exception as e:
             logger.warning("google_maps.feed_not_found", error=str(e))
             return []
-        
+
         result_urls = []
         seen_urls = set()
         last_height = 0
         scroll_attempts = 0
-        max_scroll_attempts = 50  # Prevent infinite loops
-        
+        max_scroll_attempts = 50
+
         while scroll_attempts < max_scroll_attempts:
-            # Check if we've reached max_results
             if max_results and len(result_urls) >= max_results:
-                logger.info(
-                    "google_maps.max_results_reached_during_scroll",
-                    collected=len(result_urls),
-                    max_results=max_results
-                )
                 break
-            
-            # Get current result URLs
+
             try:
-                card_elements = await page.query_selector_all('a.hfpxzc')
-                new_count = 0
-                
+                card_elements = await page.query_selector_all("a.hfpxzc")
                 for card in card_elements:
-                    href = await card.get_attribute('href')
+                    href = await card.get_attribute("href")
                     if href and href not in seen_urls:
                         seen_urls.add(href)
                         result_urls.append(href)
-                        new_count += 1
-                
-                logger.debug(
-                    "google_maps.scroll_iteration",
-                    attempt=scroll_attempts + 1,
-                    new_urls=new_count,
-                    total_urls=len(result_urls)
-                )
-                
             except Exception as e:
                 logger.warning("google_maps.url_collection_error", error=str(e))
-            
-            # Scroll the feed container
+
             try:
                 feed = await page.query_selector(feed_selector)
                 if feed:
-                    # Get current scroll height
-                    current_height = await page.evaluate(
-                        '(el) => el.scrollHeight',
-                        feed
-                    )
-                    
-                    # Scroll to bottom
-                    await page.evaluate(
-                        '(el) => el.scrollTo(0, el.scrollHeight)',
-                        feed
-                    )
-                    
-                    # Wait for new content to load
+                    current_height = await page.evaluate("(el) => el.scrollHeight", feed)
+                    await page.evaluate("(el) => el.scrollTo(0, el.scrollHeight)", feed)
                     await page.wait_for_timeout(3000)
-                    
-                    # Check if we've reached the end
-                    new_height = await page.evaluate(
-                        '(el) => el.scrollHeight',
-                        feed
-                    )
-                    
+                    new_height = await page.evaluate("(el) => el.scrollHeight", feed)
+
                     if new_height == last_height:
-                        # Check for end-of-list indicator
-                        end_element = await page.query_selector('.PbZDve')
+                        end_element = await page.query_selector(".PbZDve")
                         if end_element:
-                            logger.info("google_maps.end_of_list_reached")
                             break
-                        
-                        # Try clicking last result to trigger more loading
                         try:
-                            await page.evaluate('''
-                                () => {
-                                    const cards = document.querySelectorAll('a.hfpxzc');
-                                    if (cards.length > 0) {
-                                        cards[cards.length - 1].click();
-                                    }
-                                }
-                            ''')
+                            await page.evaluate(
+                                "() => { const c = document.querySelectorAll('a.hfpxzc'); if (c.length) c[c.length-1].click(); }"
+                            )
                             await page.wait_for_timeout(2000)
                         except Exception:
                             pass
-                    
+
                     last_height = new_height
-                    
             except Exception as e:
                 logger.warning("google_maps.scroll_error", error=str(e))
                 break
-            
+
             scroll_attempts += 1
-        
-        # Trim to max_results if needed
+
         if max_results and len(result_urls) > max_results:
             result_urls = result_urls[:max_results]
-        
+
         return result_urls
-    
+
     async def _extract_from_detail_pages(
-        self,
-        page,
-        source: Source,
-        db: Session,
-        result_urls: list[str],
-        location: str,
-        category: str,
-        max_results: Optional[int]
+        self, page, source, db, result_urls, location, category, max_results
     ) -> list[dict]:
-        """
-        Visit each business detail page and extract data.
-        
-        Args:
-            page: Playwright page object
-            source: Source model instance
-            db: SQLAlchemy database session
-            result_urls: List of business detail page URLs
-            location: Location string
-            category: Category string
-            max_results: Maximum results to extract
-            
-        Returns:
-            List of extracted business data dictionaries
-        """
         results = []
-        
         for idx, url in enumerate(result_urls):
-            # Check max_results limit
             if max_results and len(results) >= max_results:
-                logger.info(
-                    "google_maps.max_results_reached",
-                    extracted=len(results),
-                    max_results=max_results
-                )
                 break
-            
             try:
-                logger.debug(
-                    "google_maps.extracting_detail",
-                    index=idx + 1,
-                    total=len(result_urls),
-                    url=url
-                )
-                
-                # Navigate to detail page
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(2000)
-                
-                # Check for CAPTCHA
+
                 if await self._detect_captcha(page):
-                    logger.warning(
-                        "google_maps.captcha_detected",
-                        results_collected=len(results)
-                    )
-                    # Return partial results
+                    logger.warning("google_maps.captcha_detected", results_collected=len(results))
                     return results
-                
-                # Wait for main content
+
                 try:
                     await page.wait_for_selector('[role="main"]', timeout=10000)
                 except Exception:
-                    logger.warning("google_maps.main_content_not_found", url=url)
                     continue
-                
-                # Extract business data
-                business_data = await self._extract_business_data(page, source, db, url, location, category)
-                
+
+                business_data = await self._extract_business_data(
+                    page, source, db, url, location, category
+                )
                 if business_data:
                     results.append(business_data)
-                    logger.debug(
-                        "google_maps.business_extracted",
-                        name=business_data.get('name'),
-                        has_coordinates=bool(business_data.get('latitude'))
-                    )
-                
-                # Delay between detail pages
+
                 await page.wait_for_timeout(3000)
-                
             except Exception as e:
-                logger.warning(
-                    "google_maps.detail_extraction_error",
-                    url=url,
-                    error=str(e)
-                )
+                logger.warning("google_maps.detail_extraction_error", url=url, error=str(e))
                 continue
-        
+
         return results
-    
+
     async def _extract_business_data(
-        self,
-        page,
-        source: Source,
-        db: Session,
-        url: str,
-        location: str,
-        category: str
+        self, page, source, db, url, location, category
     ) -> Optional[dict]:
-        """
-        Extract business data from detail page using healing-enabled extraction.
-        
-        Args:
-            page: Playwright page object
-            source: Source model instance
-            db: SQLAlchemy database session
-            url: Current page URL
-            location: Location string
-            category: Category string
-            
-        Returns:
-            Dictionary of business data or None if extraction fails
-        """
         try:
-            # Wait for main content to be available
             try:
                 main_elem = await page.wait_for_selector('[role="main"]', timeout=10000)
             except Exception:
-                logger.warning("google_maps.main_content_not_found", url=url)
                 return None
-            
-            # Extract name with healing
-            name = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='name'
-            )
-            
+
+            name = await self._extract_field_with_healing(main_elem, page, source, db, "name")
             if not name:
-                logger.warning("google_maps.name_not_found", url=url)
                 return None
-            
-            # Extract address with healing
-            address = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='address'
-            )
-            
-            # Extract phone with healing
-            phone = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='phone'
-            )
-            
-            # Extract rating with healing
-            rating_text = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='rating'
-            )
-            
-            # Parse rating from text
+
+            address = await self._extract_field_with_healing(main_elem, page, source, db, "address")
+            phone = await self._extract_field_with_healing(main_elem, page, source, db, "phone")
+            rating_text = await self._extract_field_with_healing(main_elem, page, source, db, "rating")
+            review_text = await self._extract_field_with_healing(main_elem, page, source, db, "review_count")
+            category_label = await self._extract_field_with_healing(main_elem, page, source, db, "category_label")
+            business_status = await self._extract_field_with_healing(main_elem, page, source, db, "business_status")
+
             rating = None
             if rating_text:
                 try:
                     rating = float(rating_text.strip())
                 except (ValueError, AttributeError):
                     pass
-            
-            # Extract review count with healing
-            review_text = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='review_count'
-            )
-            
-            # Parse review count from text
+
             review_count = None
             if review_text:
-                match = re.search(r'([\d,]+)', review_text)
+                match = re.search(r"([\d,]+)", review_text)
                 if match:
-                    review_count_str = match.group(1).replace(',', '')
                     try:
-                        review_count = int(review_count_str)
+                        review_count = int(match.group(1).replace(",", ""))
                     except ValueError:
                         pass
-            
-            # Extract website - special handling for href attribute
+
             website = None
-            website_selector_record = self.selectors.get('website')
+            website_selector_record = self.selectors.get("website")
             if website_selector_record:
                 try:
                     website_link = await main_elem.query_selector(website_selector_record.selector)
                     if website_link:
-                        website = await website_link.get_attribute('href')
+                        website = await website_link.get_attribute("href")
                 except Exception:
                     pass
-            
-            # Extract category label with healing
-            category_label = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='category_label'
-            )
-            
-            # Extract business status with healing
-            business_status = await self._extract_field_with_healing(
-                card=main_elem,
-                page=page,
-                source=source,
-                db=db,
-                field_name='business_status'
-            )
-            
-            # Extract thumbnail_url (business photo)
+
             thumbnail_url = None
             try:
-                thumbnail_url = await page.evaluate('''() => {
-                    const img = document.querySelector('button[jsaction*="photo"] img, .RZ66Rb.FgCUCc img, [data-photo-index] img');
-                    return img ? img.src : null;
-                }''')
-            except Exception as e:
-                logger.debug("google_maps.thumbnail_extraction_failed", error=str(e))
-            
-            # Extract coordinates from URL
+                thumbnail_url = await page.evaluate(
+                    "() => { const img = document.querySelector('button[jsaction*=\"photo\"] img, .RZ66Rb.FgCUCc img, [data-photo-index] img'); return img ? img.src : null; }"
+                )
+            except Exception:
+                pass
+
             latitude, longitude = self._parse_coordinates_from_url(url)
-            
-            # Build result dictionary
-            result = {
+
+            return {
                 "name": name,
-                "address": address,  # Leave None if not found
+                "address": address,
                 "city": location,
                 "phone_primary": phone,
                 "website": website,
@@ -501,71 +654,22 @@ class GoogleMapsScraper(BaseScraper):
                 "longitude": longitude,
                 "category": category_label or category,
                 "business_status": business_status,
-                "currency": "NPR",  # Default for Nepal
+                "currency": "NPR",
+                "scraper_source": "playwright",
             }
-            
-            return result
-            
+
         except Exception as e:
-            logger.error(
-                "google_maps.extraction_error",
-                url=url,
-                error=str(e)
-            )
+            logger.error("google_maps.extraction_error", url=url, error=str(e))
             return None
-    
-    def _parse_coordinates_from_url(self, url: str) -> tuple[Optional[float], Optional[float]]:
-        """
-        Parse latitude and longitude from Google Maps URL.
-        
-        Google Maps URLs contain coordinates in multiple formats:
-        - .../@27.6826021,85.3323243,...
-        - ...!3d27.6826021!4d85.3323243...
-        
-        Args:
-            url: Google Maps URL
-            
-        Returns:
-            Tuple of (latitude, longitude) or (None, None) if parsing fails
-        """
+
+    def _parse_coordinates_from_url(self, url: str):
         try:
-            # Try pattern 1: !3dLAT!4dLNG (most common in detail pages)
-            match = re.search(r'!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)', url)
+            match = re.search(r"!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)", url)
             if match:
-                latitude = float(match.group(1))
-                longitude = float(match.group(2))
-                
-                logger.debug(
-                    "google_maps.coordinates_parsed",
-                    latitude=latitude,
-                    longitude=longitude,
-                    pattern="3d4d"
-                )
-                
-                return latitude, longitude
-            
-            # Try pattern 2: @LAT,LNG (fallback)
-            match = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', url)
+                return float(match.group(1)), float(match.group(2))
+            match = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", url)
             if match:
-                latitude = float(match.group(1))
-                longitude = float(match.group(2))
-                
-                logger.debug(
-                    "google_maps.coordinates_parsed",
-                    latitude=latitude,
-                    longitude=longitude,
-                    pattern="@"
-                )
-                
-                return latitude, longitude
-            
-            logger.warning("google_maps.coordinates_not_found_in_url", url=url)
-            return None, None
-                
-        except Exception as e:
-            logger.warning(
-                "google_maps.coordinate_parsing_error",
-                url=url,
-                error=str(e)
-            )
-            return None, None
+                return float(match.group(1)), float(match.group(2))
+        except Exception:
+            pass
+        return None, None

@@ -226,6 +226,9 @@ export function JobResultsPage() {
                           Completeness
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-slate-700 uppercase tracking-wider">
+                          Source
+                        </th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-slate-700 uppercase tracking-wider">
                           Status
                         </th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-slate-700 uppercase tracking-wider">
@@ -255,6 +258,19 @@ export function JobResultsPage() {
                             <div className="w-32">
                               <ProgressBar percentage={result.data_completeness || 0} />
                             </div>
+                          </td>
+                          <td className="px-4 py-3">
+                            {result.scraper_source ? (
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                                result.scraper_source === 'go_scraper' 
+                                  ? 'bg-green-100 text-green-800' 
+                                  : 'bg-blue-100 text-blue-800'
+                              }`}>
+                                {result.scraper_source === 'go_scraper' ? '⚡ Go' : '🎭 ' + result.scraper_source}
+                              </span>
+                            ) : (
+                              <span className="text-xs text-slate-400">Unknown</span>
+                            )}
                           </td>
                           <td className="px-4 py-3">
                             <StatusBadge status={result.status} />

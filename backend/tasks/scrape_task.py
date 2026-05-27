@@ -39,10 +39,16 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     broker_connection_retry_on_startup=True,
+    beat_schedule={
+        'cleanup-go-scraper-queue': {
+            'task': 'tasks.cleanup_go_scraper_queue',
+            'schedule': 300.0,  # Every 5 minutes (300 seconds)
+        },
+    },
 )
 
 
-@celery_app.task(name="tasks.scrape_task", time_limit=300, soft_time_limit=270)
+@celery_app.task(name="tasks.scrape_task", time_limit=5400, soft_time_limit=5100)
 def scrape_task(job_id: str):
     """
     Main scrape task entry point.
@@ -51,8 +57,8 @@ def scrape_task(job_id: str):
     based on MOCK_MODE environment variable.
     
     Time limits:
-    - Soft limit: 270 seconds (4.5 minutes) - raises SoftTimeLimitExceeded
-    - Hard limit: 300 seconds (5 minutes) - kills the task
+    - Soft limit: 5100 seconds (85 minutes) - raises SoftTimeLimitExceeded
+    - Hard limit: 5400 seconds (90 minutes) - kills the task
     
     Args:
         job_id: UUID string of the scrape job
@@ -243,7 +249,7 @@ def real_scrape_task_impl(job_id: str):
         except SoftTimeLimitExceeded:
             logger.error("job.timeout", job_id=job_id, message="Task exceeded soft time limit")
             job.status = "FAILED"
-            job.error_message = "Task timeout: exceeded 4.5 minute limit"
+            job.error_message = "Task timeout: exceeded 85 minute limit"
             job.completed_at = datetime.utcnow()
             db.commit()
             return
@@ -262,8 +268,43 @@ def real_scrape_task_impl(job_id: str):
             failed_sources=len(failed_source_ids)
         )
         
+        # Track statistics for notification
+        stats = {
+            "raw_scraped": len(raw_results),
+            "by_source": {},
+            "by_source_name": {},  # Add source names for display
+            "new_records": 0,
+            "duplicates": 0,
+            "updated_records": 0,
+            "progress_message": f"✅ Scraping complete - {len(raw_results)} hotels found"
+        }
+        
+        # Update progress message immediately
+        job.statistics = stats
+        db.commit()
+        
+        # Load source names for display
+        from models.source import Source
+        source_map = {}
+        for result in raw_results:
+            source_id = result.get("source_id", 1)
+            if source_id not in source_map:
+                source = db.query(Source).filter(Source.id == source_id).first()
+                if source:
+                    source_map[source_id] = source.display_name or source.name
+        
+        # Count results by source
+        for result in raw_results:
+            source_id = result.get("source_id", 1)
+            stats["by_source"][source_id] = stats["by_source"].get(source_id, 0) + 1
+            
+            # Also track by source name for display
+            source_name = source_map.get(source_id, f"Source #{source_id}")
+            stats["by_source_name"][source_name] = stats["by_source_name"].get(source_name, 0) + 1
+        
         # Run cleaning pipeline for each source's results
         total_cleaned = 0
+        total_updated = 0
         
         # Group results by source_id
         results_by_source = {}
@@ -276,23 +317,44 @@ def real_scrape_task_impl(job_id: str):
         # Process each source's results through cleaning pipeline
         for source_id, source_results in results_by_source.items():
             cleaner = CleaningPipeline(db)
-            cleaned_results = cleaner.process(
+            cleaned_results, updated_count = cleaner.process(
                 source_results,
                 str(job_uuid),
                 source_id,
                 job.category_id
             )
             total_cleaned += len(cleaned_results)
+            total_updated += updated_count
+            
+            # Track deduplication stats
+            # The difference between source_results and cleaned_results is duplicates
+            duplicates_for_source = len(source_results) - len(cleaned_results)
+            stats["duplicates"] += duplicates_for_source
+        
+        # Calculate new records (cleaned results that weren't duplicates)
+        stats["new_records"] = total_cleaned
+        stats["updated_records"] = total_updated
         
         logger.info(
             "job.cleaning_complete",
             job_id=job_id,
-            cleaned_result_count=total_cleaned
+            cleaned_result_count=total_cleaned,
+            updated_record_count=total_updated
         )
+        
+        # Update progress message after cleaning
+        stats["progress_message"] = f"✅ Cleaning complete - {stats['new_records']} new, {stats['duplicates']} duplicates, {stats['updated_records']} updated"
+        job.statistics = stats
+        db.commit()
         
         # Phase 6A: Merge results from multiple sources (Clean → Merge → Geocode)
         if total_cleaned > 0:
             try:
+                # Update progress before merging
+                stats["progress_message"] = "🔄 Merging data from multiple sources..."
+                job.statistics = stats
+                db.commit()
+                
                 from scrapers.merger import MergingPipeline
                 merge_stats = MergingPipeline(db).run(str(job_uuid))
                 logger.info(
@@ -301,6 +363,11 @@ def real_scrape_task_impl(job_id: str):
                     merged_groups=merge_stats["merged_groups"],
                     total_records_processed=merge_stats["total_records_processed"]
                 )
+                
+                # Update progress after merging
+                stats["progress_message"] = f"✅ Merging complete - {merge_stats['merged_groups']} groups merged"
+                job.statistics = stats
+                db.commit()
             except Exception as merge_error:
                 logger.warning(
                     "job.merging_failed",
@@ -313,6 +380,11 @@ def real_scrape_task_impl(job_id: str):
         # Phase 4B: Geocode cleaned results
         if settings.GEOCODING_ENABLED and total_cleaned > 0:
             try:
+                # Update progress before geocoding
+                stats["progress_message"] = "📍 Adding location coordinates..."
+                job.statistics = stats
+                db.commit()
+                
                 geocoded_count = asyncio.run(
                     geocode_job_results(db, str(job_uuid))
                 )
@@ -321,6 +393,11 @@ def real_scrape_task_impl(job_id: str):
                     job_id=job_id,
                     geocoded_count=geocoded_count
                 )
+                
+                # Update progress after geocoding
+                stats["progress_message"] = f"✅ Geocoding complete - {geocoded_count} locations added"
+                job.statistics = stats
+                db.commit()
             except Exception as geocoding_error:
                 # Log error but don't fail the job
                 logger.warning(
@@ -330,17 +407,22 @@ def real_scrape_task_impl(job_id: str):
                     exc_info=True
                 )
         
-        # Update job with results
+        # Update job with results and statistics
         job.status = "DONE"
         job.completed_at = datetime.utcnow()
         job.failed_source_ids = failed_source_ids if failed_source_ids else None
+        job.statistics = stats  # Save statistics for display
         db.commit()
         
         logger.info(
             "job.done",
             job_id=job_id,
             result_count=total_cleaned,
-            failed_sources=len(failed_source_ids)
+            failed_sources=len(failed_source_ids),
+            raw_scraped=stats["raw_scraped"],
+            new_records=stats["new_records"],
+            duplicates=stats["duplicates"],
+            updated_records=stats["updated_records"]
         )
         
         # Send email notification (never crash on email failure)

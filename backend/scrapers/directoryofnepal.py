@@ -126,7 +126,11 @@ class DirectoryOfNepalScraper(BaseScraper):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=headers) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0),
+            follow_redirects=True,
+            headers=headers
+        ) as client:
             # ============================================================
             # PASS 1: Collect all listings from listing pages
             # ============================================================
@@ -253,12 +257,24 @@ class DirectoryOfNepalScraper(BaseScraper):
                     detail_url = listing['source_url']
                     logger.info(f"directoryofnepal.fetching_detail index={idx}/{len(listings)} url={detail_url}")
                     
-                    # Add delay between requests
+                    # Add delay between requests (reduced for faster scraping)
                     if idx > 1:
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.2)  # Reduced from 0.5s to 0.2s
                     
-                    response = await client.get(detail_url)
-                    response.raise_for_status()
+                    # Retry logic for detail pages
+                    response = None
+                    for attempt in range(3):
+                        try:
+                            response = await client.get(detail_url)
+                            response.raise_for_status()
+                            break
+                        except Exception as retry_err:
+                            if attempt < 2:
+                                await asyncio.sleep(1.0 * (attempt + 1))
+                                logger.debug(f"directoryofnepal.detail_retry attempt={attempt+1} url={detail_url}")
+                            else:
+                                raise retry_err
+                    
                     soup = BeautifulSoup(response.text, 'html.parser')
                     
                     # Extract full address from div.param
@@ -454,7 +470,6 @@ class DirectoryOfNepalScraper(BaseScraper):
                         'source_url': listing['source_url'],
                         'category': submajorname
                     }
-                    results.append(result)
                     results.append(result)
         
         logger.info(f"directoryofnepal.scrape_complete total_results={len(results)}")

@@ -90,7 +90,15 @@ class CleanedResult(Base):
     is_edited = Column(Boolean, nullable=False, default=False)
     is_duplicate = Column(Boolean, nullable=False, default=False)
     status = Column(String(20), nullable=False, default="PENDING", index=True)
-    
+
+    # Go scraper integration — tracks which scraper produced this result
+    scraper_source = Column(String(50), nullable=True)  # 'go_scraper', 'serpapi', 'playwright'
+
+    # Go scraper rich data — stores 33+ fields that don't fit standard columns
+    # Includes: complete_address, user_reviews, images, open_hours, popular_times,
+    #           place_id, data_id, cid, owner, about, reservations, order_online, menu
+    extra_data = Column(JSONB, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -98,3 +106,8 @@ class CleanedResult(Base):
     merged_from_sources = Column(ARRAY(Integer), nullable=True)
     confidence_score    = Column(Numeric(3, 2), nullable=True)
     merged_at           = Column(DateTime(timezone=True), nullable=True)
+
+    # Feature 2 — temporary field overrides
+    # Stores temporary edits separately from permanent ones
+    # Format: {"field_name": {"value": "new_value", "temp": true, "edited_by": 1, "edited_at": "2026-05-25T13:00:00"}}
+    user_overrides = Column(JSONB, nullable=True)

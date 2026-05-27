@@ -6,14 +6,17 @@ from typing import List, Optional
 from datetime import datetime
 import csv
 import json
-from io import StringIO
+from io import StringIO, BytesIO
 from fastapi import APIRouter, Depends, Query, HTTPException, status
+import openpyxl
+from openpyxl.styles import Font, PatternFill
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
 
 from dependencies import get_db, require_admin
 from models import User, CleanedResult
+from models.column_definition import ColumnDefinition
 from tasks.merge_task import merge_all_sources
 
 router = APIRouter()
@@ -47,6 +50,7 @@ class AdminResultResponse(BaseModel):
     id: str
     job_id: str
     source_id: int
+    source_name: Optional[str] = None
     category_id: int
     name: Optional[str]
     city: Optional[str]
@@ -59,10 +63,32 @@ class AdminResultResponse(BaseModel):
     website: Optional[str]
     description_short: Optional[str]
     rating_overall: Optional[float]
+    review_count: Optional[int]
     price_min: Optional[float]
+    price_max: Optional[float]
     currency: Optional[str]
     data_completeness: Optional[float]
     status: str
+    scraper_source: Optional[str] = None
+    merged_from_sources: Optional[List[int]] = None
+    thumbnail_url: Optional[str] = None
+    image_urls: Optional[list] = None
+    amenities: Optional[list] = None
+    opening_hours: Optional[str] = None
+    checkin_time: Optional[str] = None
+    checkout_time: Optional[str] = None
+    # Go scraper rich fields from extra_data
+    place_id: Optional[str] = None
+    data_id: Optional[str] = None
+    cid: Optional[str] = None
+    plus_code: Optional[str] = None
+    timezone: Optional[str] = None
+    business_status: Optional[str] = None
+    images_count: Optional[int] = None
+    reservations_link: Optional[str] = None
+    order_link: Optional[str] = None
+    menu_link: Optional[str] = None
+    owner_name: Optional[str] = None
     created_at: str
     
     model_config = ConfigDict(from_attributes=True)
@@ -78,28 +104,40 @@ class PaginatedAdminResultsResponse(BaseModel):
 
 @router.get("/export")
 def export_admin_results(
-    format: str = Query("csv", description="Export format: csv or json"),
+    format: str = Query("csv", description="Export format: csv, json, or excel"),
     status_filter: Optional[str] = Query(None, alias="status", description="Filter by status (PENDING, APPROVED, REJECTED)"),
     category_id: Optional[int] = Query(None, description="Filter by category ID"),
     city: Optional[str] = Query(None, description="Filter by city name"),
+    source_id: Optional[int] = Query(None, description="Filter by source ID"),
+    scraper_source: Optional[str] = Query(None, description="Filter by scraper source (go_scraper, playwright, serpapi)"),
+    is_duplicate: Optional[bool] = Query(None, description="Filter by duplicate status"),
+    min_completeness: Optional[float] = Query(None, ge=0, le=100, description="Minimum data completeness percentage"),
+    has_phone: Optional[bool] = Query(None, description="Filter by phone presence"),
+    has_website: Optional[bool] = Query(None, description="Filter by website presence"),
+    has_rating: Optional[bool] = Query(None, description="Filter by rating presence"),
+    has_opening_hours: Optional[bool] = Query(None, description="Filter by opening hours presence"),
+    created_after: Optional[str] = Query(None, description="Filter by created date (ISO format)"),
+    created_before: Optional[str] = Query(None, description="Filter by created date (ISO format)"),
     sort_by: str = Query("created_at", description="Sort by field (data_completeness or created_at)"),
+    columns: Optional[str] = Query(None, description="Comma-separated list of columns to include in export"),
+    labels: Optional[str] = Query(None, description="Column renames in format: name:New Name,city:Location"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin)
 ):
     """
-    Export filtered admin results as CSV or JSON.
+    Export filtered admin results as CSV, JSON, or Excel.
     
     - Protected by require_admin dependency
     - Accepts same filters as GET /results/
-    - format: 'csv' or 'json'
+    - format: 'csv', 'json', or 'excel'
     - Maximum 10,000 results per export
     - Returns file download with appropriate Content-Type and Content-Disposition headers
     """
     # Validate format
-    if format not in ["csv", "json"]:
+    if format not in ["csv", "json", "excel"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid format. Must be 'csv' or 'json'"
+            detail="Invalid format. Must be 'csv', 'json', or 'excel'"
         )
     
     # Build query (same as get_admin_results)
@@ -114,6 +152,71 @@ def export_admin_results(
     
     if city:
         query = query.filter(CleanedResult.city.ilike(f"%{city}%"))
+    
+    # New filters
+    if source_id is not None:
+        query = query.filter(CleanedResult.source_id == source_id)
+    
+    if scraper_source is not None:
+        query = query.filter(CleanedResult.scraper_source == scraper_source)
+    
+    if is_duplicate is not None:
+        query = query.filter(CleanedResult.is_duplicate == is_duplicate)
+    
+    if min_completeness is not None:
+        query = query.filter(CleanedResult.data_completeness >= min_completeness)
+    
+    if has_phone is not None:
+        if has_phone:
+            query = query.filter(CleanedResult.phone_primary.isnot(None))
+        else:
+            query = query.filter(CleanedResult.phone_primary.is_(None))
+    
+    if has_website is not None:
+        if has_website:
+            query = query.filter(CleanedResult.website.isnot(None))
+        else:
+            query = query.filter(CleanedResult.website.is_(None))
+    
+    if has_rating is not None:
+        if has_rating:
+            query = query.filter(CleanedResult.rating_overall.isnot(None))
+        else:
+            query = query.filter(CleanedResult.rating_overall.is_(None))
+    
+    if has_opening_hours is not None:
+        if has_opening_hours:
+            # Filter for records with non-empty opening hours (exclude NULL, '', '{}', 'Working Hours')
+            from sqlalchemy import and_
+            query = query.filter(and_(
+                CleanedResult.opening_hours.isnot(None),
+                CleanedResult.opening_hours != '',
+                CleanedResult.opening_hours != '{}',
+                CleanedResult.opening_hours != 'Working Hours'
+            ))
+        else:
+            # Filter for records without meaningful opening hours
+            from sqlalchemy import or_
+            query = query.filter(or_(
+                CleanedResult.opening_hours.is_(None),
+                CleanedResult.opening_hours == '',
+                CleanedResult.opening_hours == '{}',
+                CleanedResult.opening_hours == 'Working Hours'
+            ))
+    
+    if created_after:
+        try:
+            date_after = datetime.fromisoformat(created_after)
+            query = query.filter(CleanedResult.created_at >= date_after)
+        except ValueError:
+            pass
+    
+    if created_before:
+        try:
+            date_before = datetime.fromisoformat(created_before)
+            query = query.filter(CleanedResult.created_at <= date_before)
+        except ValueError:
+            pass
     
     # Apply sorting
     if sort_by == "data_completeness":
@@ -136,124 +239,316 @@ def export_admin_results(
     # Generate timestamp for filename
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     
+    # Parse selected columns (if provided)
+    selected_cols = [c.strip() for c in columns.split(',')] if columns else None
+    
+    # Parse labels parameter: "name:New Name,city:City Name"
+    label_map = {}
+    if labels:
+        for pair in labels.split(','):
+            if ':' in pair:
+                key, label = pair.split(':', 1)
+                label_map[key.strip()] = label.strip()
+    
     if format == "csv":
-        return export_as_csv(results, timestamp)
+        return export_as_csv(results, timestamp, selected_cols, label_map)
+    elif format == "excel":
+        return export_as_excel(results, timestamp, selected_cols, label_map)
     else:  # json
-        return export_as_json(results, timestamp, total)
+        return export_as_json(results, timestamp, total, selected_cols, label_map)
 
 
-def export_as_csv(results: List[CleanedResult], timestamp: str) -> StreamingResponse:
+def _apply_user_overrides(result: CleanedResult) -> dict:
+    """
+    Return a dict of field values with user_overrides merged on top.
+    - Temporary overrides: included in exports for the current session only
+    - Custom column overrides (temp=False, custom=True): always included
+    """
+    overrides = result.user_overrides or {}
+    fields = {
+        "name": result.name,
+        "city": result.city,
+        "address": result.address,
+        "latitude": result.latitude,
+        "longitude": result.longitude,
+        "phone_primary": result.phone_primary,
+        "phone_secondary": result.phone_secondary,
+        "email": result.email,
+        "website": result.website,
+        "description_short": result.description_short,
+        "rating_overall": result.rating_overall,
+        "review_count": result.review_count,
+        "price_min": result.price_min,
+        "price_max": result.price_max,
+        "currency": result.currency,
+        "thumbnail_url": result.thumbnail_url,
+        "opening_hours": result.opening_hours,
+        "checkin_time": result.checkin_time,
+        "checkout_time": result.checkout_time,
+    }
+    # Apply overrides (both temporary session edits and permanent custom columns)
+    for field, override in overrides.items():
+        if isinstance(override, dict) and "value" in override:
+            fields[field] = override["value"]  # includes custom columns too
+    return fields
+
+
+def export_as_csv(results: List[CleanedResult], timestamp: str, selected_cols=None, label_map=None) -> StreamingResponse:
     """
     Generate CSV export with headers and formatted data.
-    Includes latitude and longitude coordinates from Phase 4B geocoding.
+    Temporary user_overrides are merged so the export matches what the admin sees.
+    Only includes columns in selected_cols (if provided).
+    Uses label_map for column renames (FIX 2).
     """
-    # Create CSV in memory
+    label_map = label_map or {}
+    
+    # Full column map: key → (header label, value extractor)
+    ALL_COLUMNS = [
+        ("id",               "ID",                   lambda r, f: str(r.id)),
+        ("job_id",           "Job ID",               lambda r, f: str(r.job_id)),
+        ("source_id",        "Source ID",            lambda r, f: r.source_id),
+        ("source_name",      "Source Name",          lambda r, f: getattr(r, 'source_name', '') or ''),
+        ("category_id",      "Category ID",          lambda r, f: r.category_id),
+        ("name",             "Name",                 lambda r, f: f.get("name") or ""),
+        ("city",             "City",                 lambda r, f: f.get("city") or ""),
+        ("address",          "Address",              lambda r, f: f.get("address") or ""),
+        ("latitude",         "Latitude",             lambda r, f: float(f.get("latitude")) if f.get("latitude") else ""),
+        ("longitude",        "Longitude",            lambda r, f: float(f.get("longitude")) if f.get("longitude") else ""),
+        ("phone_primary",    "Phone Primary",        lambda r, f: f.get("phone_primary") or ""),
+        ("phone_secondary",  "Phone Secondary",      lambda r, f: f.get("phone_secondary") or ""),
+        ("email",            "Email",                lambda r, f: f.get("email") or ""),
+        ("website",          "Website",              lambda r, f: f.get("website") or ""),
+        ("description_short","Description",          lambda r, f: f.get("description_short") or ""),
+        ("rating_overall",   "Rating",               lambda r, f: float(f.get("rating_overall")) if f.get("rating_overall") else ""),
+        ("review_count",     "Review Count",         lambda r, f: f.get("review_count") or ""),
+        ("price_min",        "Price Min",            lambda r, f: float(f.get("price_min")) if f.get("price_min") else ""),
+        ("price_max",        "Price Max",            lambda r, f: float(f.get("price_max")) if f.get("price_max") else ""),
+        ("currency",         "Currency",             lambda r, f: f.get("currency") or ""),
+        ("thumbnail_url",    "Thumbnail URL",        lambda r, f: f.get("thumbnail_url") or ""),
+        ("image_urls",       "Image URLs",           lambda r, f: json.dumps(r.image_urls) if r.image_urls else ""),
+        ("amenities",        "Amenities",            lambda r, f: json.dumps(r.amenities) if r.amenities else ""),
+        ("opening_hours",    "Opening Hours",        lambda r, f: f.get("opening_hours") or ""),
+        ("checkin_time",     "Checkin Time",         lambda r, f: f.get("checkin_time") or ""),
+        ("checkout_time",    "Checkout Time",        lambda r, f: f.get("checkout_time") or ""),
+        ("scraper_source",   "Scraper Source",       lambda r, f: r.scraper_source or ""),
+        ("data_completeness","Data Completeness (%)",lambda r, f: float(r.data_completeness) if r.data_completeness else ""),
+        ("status",           "Status",               lambda r, f: r.status),
+        ("created_at",       "Created At",           lambda r, f: r.created_at.isoformat() if r.created_at else ""),
+    ]
+
+    # Add custom columns dynamically from selected_cols
+    if selected_cols:
+        # Find custom columns (those starting with "custom_")
+        custom_col_keys = [col for col in selected_cols if col.startswith("custom_")]
+        for custom_key in custom_col_keys:
+            # Generate a nice label from the key (e.g., "custom_test_col" -> "Test Col")
+            label = custom_key.replace("custom_", "").replace("_", " ").title()
+            ALL_COLUMNS.append((
+                custom_key,
+                label,
+                lambda r, f, key=custom_key: f.get(key) or ""
+            ))
+
+    # Filter to selected columns (or use all if none specified)
+    cols = [(k, h, fn) for k, h, fn in ALL_COLUMNS if selected_cols is None or k in selected_cols]
+    # Preserve user-selected order
+    if selected_cols:
+        col_map = {k: (k, h, fn) for k, h, fn in cols}
+        cols = [col_map[k] for k in selected_cols if k in col_map]
+    
+    # Apply label renames (FIX 2)
+    cols = [(k, label_map.get(k, h), fn) for k, h, fn in cols]
+
     output = StringIO()
     writer = csv.writer(output)
-    
-    # Write headers (Phase 4B: Added Latitude and Longitude)
-    headers = [
-        "ID", "Job ID", "Source ID", "Category ID", "Name", "City", "Address",
-        "Latitude", "Longitude", "Phone Primary", "Phone Secondary", "Email", "Website", "Description",
-        "Rating", "Price Min", "Currency", "Data Completeness (%)", "Status", "Created At"
-    ]
-    writer.writerow(headers)
-    
-    # Write data rows
+    writer.writerow([h for _, h, _ in cols])
+
     for result in results:
-        writer.writerow([
-            str(result.id),
-            str(result.job_id),
-            result.source_id,
-            result.category_id,
-            result.name or "",
-            result.city or "",
-            result.address or "",
-            float(result.latitude) if result.latitude else "",
-            float(result.longitude) if result.longitude else "",
-            result.phone_primary or "",
-            result.phone_secondary or "",
-            result.email or "",
-            result.website or "",
-            result.description_short or "",
-            float(result.rating_overall) if result.rating_overall else "",
-            float(result.price_min) if result.price_min else "",
-            result.currency or "",
-            float(result.data_completeness) if result.data_completeness else "",
-            result.status,
-            result.created_at.isoformat() if result.created_at else ""
-        ])
-    
-    # Get CSV content
+        f = _apply_user_overrides(result)
+        writer.writerow([fn(result, f) for _, _, fn in cols])
+
     csv_content = output.getvalue()
     output.close()
-    
-    # Return as streaming response
+
     return StreamingResponse(
         iter([csv_content]),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": f"attachment; filename=results_{timestamp}.csv"
-        }
+        headers={"Content-Disposition": f"attachment; filename=results_{timestamp}.csv"}
+    )
+def export_as_excel(results: List[CleanedResult], timestamp: str, selected_cols=None, label_map=None) -> StreamingResponse:
+    """
+    Generate Excel export with formatted headers and data.
+    Temporary user_overrides are merged so the export matches what the admin sees.
+    Only includes columns in selected_cols (if provided).
+    """
+    ALL_COLUMNS = [
+        ("id",               "ID",                   lambda r, f: str(r.id)),
+        ("job_id",           "Job ID",               lambda r, f: str(r.job_id)),
+        ("source_id",        "Source ID",            lambda r, f: r.source_id),
+        ("source_name",      "Source Name",          lambda r, f: getattr(r, 'source_name', '') or ''),
+        ("category_id",      "Category ID",          lambda r, f: r.category_id),
+        ("name",             "Name",                 lambda r, f: f.get("name") or ""),
+        ("city",             "City",                 lambda r, f: f.get("city") or ""),
+        ("address",          "Address",              lambda r, f: f.get("address") or ""),
+        ("latitude",         "Latitude",             lambda r, f: float(f.get("latitude")) if f.get("latitude") else None),
+        ("longitude",        "Longitude",            lambda r, f: float(f.get("longitude")) if f.get("longitude") else None),
+        ("phone_primary",    "Phone Primary",        lambda r, f: f.get("phone_primary") or ""),
+        ("phone_secondary",  "Phone Secondary",      lambda r, f: f.get("phone_secondary") or ""),
+        ("email",            "Email",                lambda r, f: f.get("email") or ""),
+        ("website",          "Website",              lambda r, f: f.get("website") or ""),
+        ("description_short","Description",          lambda r, f: f.get("description_short") or ""),
+        ("rating_overall",   "Rating",               lambda r, f: float(f.get("rating_overall")) if f.get("rating_overall") else None),
+        ("review_count",     "Review Count",         lambda r, f: f.get("review_count") or None),
+        ("price_min",        "Price Min",            lambda r, f: float(f.get("price_min")) if f.get("price_min") else None),
+        ("price_max",        "Price Max",            lambda r, f: float(f.get("price_max")) if f.get("price_max") else None),
+        ("currency",         "Currency",             lambda r, f: f.get("currency") or ""),
+        ("thumbnail_url",    "Thumbnail URL",        lambda r, f: f.get("thumbnail_url") or ""),
+        ("image_urls",       "Image URLs",           lambda r, f: json.dumps(r.image_urls) if r.image_urls else ""),
+        ("amenities",        "Amenities",            lambda r, f: json.dumps(r.amenities) if r.amenities else ""),
+        ("opening_hours",    "Opening Hours",        lambda r, f: f.get("opening_hours") or ""),
+        ("checkin_time",     "Checkin Time",         lambda r, f: f.get("checkin_time") or ""),
+        ("checkout_time",    "Checkout Time",        lambda r, f: f.get("checkout_time") or ""),
+        ("scraper_source",   "Scraper Source",       lambda r, f: r.scraper_source or ""),
+        ("data_completeness","Data Completeness (%)",lambda r, f: float(r.data_completeness) if r.data_completeness else None),
+        ("status",           "Status",               lambda r, f: r.status),
+        ("created_at",       "Created At",           lambda r, f: r.created_at.isoformat() if r.created_at else ""),
+    ]
+
+    # Add custom columns dynamically from selected_cols
+    if selected_cols:
+        custom_col_keys = [col for col in selected_cols if col.startswith("custom_")]
+        for custom_key in custom_col_keys:
+            label = custom_key.replace("custom_", "").replace("_", " ").title()
+            ALL_COLUMNS.append((
+                custom_key,
+                label,
+                lambda r, f, key=custom_key: f.get(key) or ""
+            ))
+
+    cols = [(k, h, fn) for k, h, fn in ALL_COLUMNS if selected_cols is None or k in selected_cols]
+    if selected_cols:
+        col_map = {k: (k, h, fn) for k, h, fn in cols}
+        cols = [col_map[k] for k in selected_cols if k in col_map]
+    
+    # Apply label renames (FIX 2)
+    label_map = label_map or {}
+    cols = [(k, label_map.get(k, h), fn) for k, h, fn in cols]
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Nepal Business Data"
+
+    ws.append([h for _, h, _ in cols])
+
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+
+    for result in results:
+        f = _apply_user_overrides(result)
+        ws.append([fn(result, f) for _, _, fn in cols])
+
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        ws.column_dimensions[column_letter].width = min(max_length + 2, 50)
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=nepal_business_data_{timestamp}.xlsx"}
     )
 
 
-def export_as_json(results: List[CleanedResult], timestamp: str, total: int) -> StreamingResponse:
+def export_as_json(results: List[CleanedResult], timestamp: str, total: int, selected_cols=None, label_map=None) -> StreamingResponse:
     """
-    Generate JSON export with metadata and results array.
-    Phase 4B: Includes latitude, longitude, and geocoding metadata.
+    Generate JSON export with metadata and full results array.
+    Only includes keys in selected_cols (if provided).
     """
-    # Count geocoded results
     geocoded_count = sum(1 for r in results if r.latitude is not None and r.longitude is not None)
     geocoding_success_rate = (geocoded_count / total * 100) if total > 0 else 0
-    
-    # Build JSON structure
+
     data = {
         "metadata": {
             "exported_at": datetime.utcnow().isoformat(),
             "total_count": total,
             "geocoded_count": geocoded_count,
             "geocoding_success_rate": f"{geocoding_success_rate:.1f}%",
-            "format": "json"
+            "format": "json",
+            "columns": selected_cols or "all"
         },
         "results": []
     }
-    
-    # Add results (Phase 4B: Added latitude and longitude)
+
+    # Full field map: key → value extractor
+    ALL_FIELDS = {
+        "id":               lambda r, f: str(r.id),
+        "job_id":           lambda r, f: str(r.job_id),
+        "source_id":        lambda r, f: r.source_id,
+        "source_name":      lambda r, f: getattr(r, 'source_name', None),
+        "category_id":      lambda r, f: r.category_id,
+        "name":             lambda r, f: f.get("name"),
+        "city":             lambda r, f: f.get("city"),
+        "address":          lambda r, f: f.get("address"),
+        "latitude":         lambda r, f: float(f.get("latitude")) if f.get("latitude") else None,
+        "longitude":        lambda r, f: float(f.get("longitude")) if f.get("longitude") else None,
+        "phone_primary":    lambda r, f: f.get("phone_primary"),
+        "phone_secondary":  lambda r, f: f.get("phone_secondary"),
+        "email":            lambda r, f: f.get("email"),
+        "website":          lambda r, f: f.get("website"),
+        "description_short":lambda r, f: f.get("description_short"),
+        "rating_overall":   lambda r, f: float(f.get("rating_overall")) if f.get("rating_overall") else None,
+        "review_count":     lambda r, f: f.get("review_count"),
+        "price_min":        lambda r, f: float(f.get("price_min")) if f.get("price_min") else None,
+        "price_max":        lambda r, f: float(f.get("price_max")) if f.get("price_max") else None,
+        "currency":         lambda r, f: f.get("currency"),
+        "thumbnail_url":    lambda r, f: f.get("thumbnail_url"),
+        "image_urls":       lambda r, f: r.image_urls or [],
+        "amenities":        lambda r, f: r.amenities or [],
+        "opening_hours":    lambda r, f: f.get("opening_hours"),
+        "checkin_time":     lambda r, f: f.get("checkin_time"),
+        "checkout_time":    lambda r, f: f.get("checkout_time"),
+        "scraper_source":   lambda r, f: r.scraper_source,
+        "data_completeness":lambda r, f: float(r.data_completeness) if r.data_completeness else None,
+        "status":           lambda r, f: r.status,
+        "created_at":       lambda r, f: r.created_at.isoformat() if r.created_at else None,
+    }
+
+    # Add custom columns dynamically from selected_cols
+    if selected_cols:
+        custom_col_keys = [col for col in selected_cols if col.startswith("custom_")]
+        for custom_key in custom_col_keys:
+            ALL_FIELDS[custom_key] = lambda r, f, key=custom_key: f.get(key)
+
+    # Determine which fields to include
+    fields_to_include = selected_cols if selected_cols else list(ALL_FIELDS.keys())
+
     for result in results:
-        data["results"].append({
-            "id": str(result.id),
-            "job_id": str(result.job_id),
-            "source_id": result.source_id,
-            "category_id": result.category_id,
-            "name": result.name,
-            "city": result.city,
-            "address": result.address,
-            "latitude": float(result.latitude) if result.latitude else None,
-            "longitude": float(result.longitude) if result.longitude else None,
-            "phone_primary": result.phone_primary,
-            "phone_secondary": result.phone_secondary,
-            "email": result.email,
-            "website": result.website,
-            "description_short": result.description_short,
-            "rating_overall": float(result.rating_overall) if result.rating_overall else None,
-            "price_min": float(result.price_min) if result.price_min else None,
-            "currency": result.currency,
-            "data_completeness": float(result.data_completeness) if result.data_completeness else None,
-            "status": result.status,
-            "created_at": result.created_at.isoformat() if result.created_at else None
-        })
-    
-    # Convert to JSON string
+        f = _apply_user_overrides(result)
+        row = {}
+        for key in fields_to_include:
+            if key in ALL_FIELDS:
+                row[key] = ALL_FIELDS[key](result, f)
+        data["results"].append(row)
+
     json_content = json.dumps(data, indent=2)
-    
-    # Return as streaming response
+
     return StreamingResponse(
         iter([json_content]),
         media_type="application/json",
-        headers={
-            "Content-Disposition": f"attachment; filename=results_{timestamp}.json"
-        }
+        headers={"Content-Disposition": f"attachment; filename=results_{timestamp}.json"}
     )
 
 
@@ -262,6 +557,16 @@ def get_admin_results(
     status: Optional[str] = Query(None, description="Filter by status (PENDING, APPROVED, REJECTED)"),
     category_id: Optional[int] = Query(None, description="Filter by category ID"),
     city: Optional[str] = Query(None, description="Filter by city name"),
+    source_id: Optional[int] = Query(None, description="Filter by source ID"),
+    scraper_source: Optional[str] = Query(None, description="Filter by scraper source (go_scraper, playwright, serpapi)"),
+    is_duplicate: Optional[bool] = Query(None, description="Filter by duplicate status (true=duplicates only, false=unique only)"),
+    min_completeness: Optional[float] = Query(None, ge=0, le=100, description="Minimum data completeness percentage"),
+    has_phone: Optional[bool] = Query(None, description="Filter by phone presence (true=has phone, false=no phone)"),
+    has_website: Optional[bool] = Query(None, description="Filter by website presence (true=has website, false=no website)"),
+    has_rating: Optional[bool] = Query(None, description="Filter by rating presence (true=has rating, false=no rating)"),
+    has_opening_hours: Optional[bool] = Query(None, description="Filter by opening hours presence"),
+    created_after: Optional[str] = Query(None, description="Filter by created date (ISO format: YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="Filter by created date (ISO format: YYYY-MM-DD)"),
     sort_by: str = Query("created_at", description="Sort by field (data_completeness or created_at)"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, ge=1, le=200, description="Page size (max 200)"),
@@ -272,7 +577,8 @@ def get_admin_results(
     Get paginated cleaned results for admin review.
     
     - Protected by require_admin dependency
-    - Accepts query params: status, category_id, city, sort_by, page, page_size
+    - Accepts query params: status, category_id, city, source_id, scraper_source, is_duplicate, min_completeness, 
+      has_phone, has_website, has_rating, created_after, created_before, sort_by, page, page_size
     - sort_by can be 'data_completeness' or 'created_at'
     - Default page_size=50, max page_size=200
     - Returns paginated envelope with items, total, page, page_size, pages
@@ -280,15 +586,76 @@ def get_admin_results(
     # Build query
     query = db.query(CleanedResult)
     
-    # Apply filters
-    if status:
-        query = query.filter(CleanedResult.status == status)
-    
     if category_id:
         query = query.filter(CleanedResult.category_id == category_id)
     
     if city:
         query = query.filter(CleanedResult.city.ilike(f"%{city}%"))
+    
+    # New filters
+    if source_id is not None:
+        query = query.filter(CleanedResult.source_id == source_id)
+    
+    if scraper_source is not None:
+        query = query.filter(CleanedResult.scraper_source == scraper_source)
+    
+    if is_duplicate is not None:
+        query = query.filter(CleanedResult.is_duplicate == is_duplicate)
+    
+    if min_completeness is not None:
+        query = query.filter(CleanedResult.data_completeness >= min_completeness)
+    
+    if has_phone is not None:
+        if has_phone:
+            query = query.filter(CleanedResult.phone_primary.isnot(None))
+        else:
+            query = query.filter(CleanedResult.phone_primary.is_(None))
+    
+    if has_website is not None:
+        if has_website:
+            query = query.filter(CleanedResult.website.isnot(None))
+        else:
+            query = query.filter(CleanedResult.website.is_(None))
+    
+    if has_rating is not None:
+        if has_rating:
+            query = query.filter(CleanedResult.rating_overall.isnot(None))
+        else:
+            query = query.filter(CleanedResult.rating_overall.is_(None))
+    
+    if has_opening_hours is not None:
+        if has_opening_hours:
+            # Filter for records with non-empty opening hours (exclude NULL, '', '{}', 'Working Hours')
+            from sqlalchemy import and_
+            query = query.filter(and_(
+                CleanedResult.opening_hours.isnot(None),
+                CleanedResult.opening_hours != '',
+                CleanedResult.opening_hours != '{}',
+                CleanedResult.opening_hours != 'Working Hours'
+            ))
+        else:
+            # Filter for records without meaningful opening hours
+            from sqlalchemy import or_
+            query = query.filter(or_(
+                CleanedResult.opening_hours.is_(None),
+                CleanedResult.opening_hours == '',
+                CleanedResult.opening_hours == '{}',
+                CleanedResult.opening_hours == 'Working Hours'
+            ))
+    
+    if created_after:
+        try:
+            date_after = datetime.fromisoformat(created_after)
+            query = query.filter(CleanedResult.created_at >= date_after)
+        except ValueError:
+            pass  # Ignore invalid date format
+    
+    if created_before:
+        try:
+            date_before = datetime.fromisoformat(created_before)
+            query = query.filter(CleanedResult.created_at <= date_before)
+        except ValueError:
+            pass  # Ignore invalid date format
     
     # Apply sorting
     if sort_by == "data_completeness":
@@ -301,17 +668,81 @@ def get_admin_results(
     
     # Get paginated results
     results = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    # Clear TEMPORARY user_overrides for results on this page.
+    # Temporary edits are session-scoped: they show in the UI and export for
+    # the current session, but are wiped the moment the data is re-fetched
+    # (i.e. on page refresh). Custom column data (temp=False, custom=True) is preserved.
+    from sqlalchemy.orm.attributes import flag_modified
+    needs_commit = False
+    for result in results:
+        if result.user_overrides:
+            # Keep only non-temporary overrides (custom columns)
+            kept = {k: v for k, v in result.user_overrides.items()
+                    if isinstance(v, dict) and not v.get("temp", False)}
+            if kept != result.user_overrides:
+                result.user_overrides = kept
+                flag_modified(result, "user_overrides")
+                needs_commit = True
+    if needs_commit:
+        db.commit()
     
     # Calculate total pages
     pages = -(-total // page_size) if total > 0 else 0  # Ceiling division
+
+    # Build source name lookup for this page
+    from models import Source
+    source_ids = list({r.source_id for r in results})
+    sources = db.query(Source).filter(Source.id.in_(source_ids)).all()
+    source_name_map = {s.id: (s.display_name or s.name) for s in sources}
     
-    # Convert to response format (Phase 4B: Added latitude and longitude)
+    # Convert to response format
     items = []
     for result in results:
+        # Extract Go scraper rich fields from extra_data
+        extra = result.extra_data or {}
+        
+        # Extract images from extra_data if available
+        images_from_extra = []
+        if extra.get('images'):
+            images_from_extra = [img.get('link') for img in extra['images'] if isinstance(img, dict) and img.get('link')]
+        
+        # Get reservations, order, menu links
+        reservations_link = None
+        order_link = None
+        menu_link = None
+        
+        if extra.get('reservations'):
+            if isinstance(extra['reservations'], list) and len(extra['reservations']) > 0:
+                reservations_link = extra['reservations'][0].get('link')
+            elif isinstance(extra['reservations'], dict):
+                reservations_link = extra['reservations'].get('link')
+        
+        if extra.get('order_online'):
+            if isinstance(extra['order_online'], list) and len(extra['order_online']) > 0:
+                order_link = extra['order_online'][0].get('link')
+            elif isinstance(extra['order_online'], dict):
+                order_link = extra['order_online'].get('link')
+        
+        if extra.get('menu'):
+            if isinstance(extra['menu'], dict):
+                menu_link = extra['menu'].get('link')
+            elif isinstance(extra['menu'], str):
+                menu_link = extra['menu']
+        
+        # Get owner name
+        owner_name = None
+        if extra.get('owner'):
+            if isinstance(extra['owner'], dict):
+                owner_name = extra['owner'].get('name')
+            elif isinstance(extra['owner'], str):
+                owner_name = extra['owner']
+        
         items.append({
             "id": str(result.id),
             "job_id": str(result.job_id),
             "source_id": result.source_id,
+            "source_name": source_name_map.get(result.source_id),
             "category_id": result.category_id,
             "name": result.name,
             "city": result.city,
@@ -324,10 +755,32 @@ def get_admin_results(
             "website": result.website,
             "description_short": result.description_short,
             "rating_overall": float(result.rating_overall) if result.rating_overall else None,
+            "review_count": result.review_count,
             "price_min": float(result.price_min) if result.price_min else None,
+            "price_max": float(result.price_max) if result.price_max else None,
             "currency": result.currency,
             "data_completeness": float(result.data_completeness) if result.data_completeness else None,
             "status": result.status,
+            "scraper_source": result.scraper_source,
+            "merged_from_sources": result.merged_from_sources if result.merged_from_sources else [],
+            "thumbnail_url": result.thumbnail_url,
+            "image_urls": images_from_extra if images_from_extra else (result.image_urls if result.image_urls else []),
+            "amenities": result.amenities if result.amenities else [],
+            "opening_hours": result.opening_hours,
+            "checkin_time": result.checkin_time,
+            "checkout_time": result.checkout_time,
+            # Go scraper rich fields
+            "place_id": extra.get('place_id'),
+            "data_id": extra.get('data_id'),
+            "cid": extra.get('cid'),
+            "plus_code": extra.get('plus_code'),
+            "timezone": extra.get('timezone'),
+            "business_status": extra.get('business_status'),
+            "images_count": len(images_from_extra) if images_from_extra else result.image_count,
+            "reservations_link": reservations_link,
+            "order_link": order_link,
+            "menu_link": menu_link,
+            "owner_name": owner_name,
             "created_at": result.created_at.isoformat() if result.created_at else None
         })
     
@@ -843,3 +1296,139 @@ def get_healing_stats(
         ]
     }
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COLUMN DEFINITIONS ENDPOINTS (FIX 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/column-definitions")
+def get_column_definitions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Get all custom column definitions.
+    
+    Returns list of column definitions with id, name, display_name, is_temporary.
+    Protected by require_admin dependency.
+    """
+    cols = db.query(ColumnDefinition).order_by(ColumnDefinition.created_at).all()
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "display_name": c.display_name,
+            "is_temporary": c.is_temporary,
+            "created_at": c.created_at.isoformat() if c.created_at else None
+        }
+        for c in cols
+    ]
+
+
+class CreateColumnDefinitionRequest(BaseModel):
+    name: str
+    display_name: str
+    is_temporary: bool = False
+
+
+@router.post("/column-definitions")
+def create_column_definition(
+    request: CreateColumnDefinitionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Create a new custom column definition.
+    
+    - name: Column key (e.g., "custom_verification_status")
+    - display_name: Human-readable label (e.g., "Verification Status")
+    - is_temporary: If True, column is session-scoped
+    
+    Protected by require_admin dependency.
+    """
+    # Check if column already exists
+    existing = db.query(ColumnDefinition).filter(
+        ColumnDefinition.name == request.name
+    ).first()
+    
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Column '{request.name}' already exists"
+        )
+    
+    col = ColumnDefinition(
+        name=request.name,
+        display_name=request.display_name,
+        is_temporary=request.is_temporary,
+        created_by=current_user.id
+    )
+    db.add(col)
+    db.commit()
+    db.refresh(col)
+    
+    return {
+        "id": col.id,
+        "name": col.name,
+        "display_name": col.display_name,
+        "is_temporary": col.is_temporary
+    }
+
+
+@router.delete("/column-definitions/{col_id}")
+def delete_column_definition(
+    col_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Delete a custom column definition.
+    
+    Protected by require_admin dependency.
+    """
+    col = db.query(ColumnDefinition).filter(ColumnDefinition.id == col_id).first()
+    
+    if not col:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Column definition {col_id} not found"
+        )
+    
+    db.delete(col)
+    db.commit()
+    
+    return {"success": True, "message": f"Column '{col.name}' deleted"}
+
+
+@router.put("/column-definitions/{col_id}")
+def update_column_definition(
+    col_id: int,
+    display_name: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """
+    Update a column definition's display name (for permanent renames).
+    
+    Protected by require_admin dependency.
+    """
+    col = db.query(ColumnDefinition).filter(ColumnDefinition.id == col_id).first()
+    
+    if not col:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Column definition {col_id} not found"
+        )
+    
+    col.display_name = display_name
+    col.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(col)
+    
+    return {
+        "id": col.id,
+        "name": col.name,
+        "display_name": col.display_name,
+        "is_temporary": col.is_temporary
+    }

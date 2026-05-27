@@ -5,6 +5,7 @@ Handles admin-only operations for result validation (inline edit, approve, rejec
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel, Field, validator
 from decimal import Decimal
 
@@ -19,16 +20,12 @@ class InlineEditRequest(BaseModel):
     """Request schema for inline editing a single field"""
     field_name: str = Field(..., description="Name of the field to edit")
     field_value: Optional[str] = Field(None, description="New value for the field (can be null)")
+    temporary: bool = Field(False, description="If true, store in user_overrides; if false, update main column")
     
     @validator('field_name')
     def validate_field_name(cls, v):
-        """Only allow editing specific fields"""
-        allowed_fields = [
-            'name', 'city', 'address', 'rating_overall', 'price_min',
-            'phone_primary', 'email', 'website', 'description_short'
-        ]
-        if v not in allowed_fields:
-            raise ValueError(f"Field '{v}' is not editable. Allowed fields: {', '.join(allowed_fields)}")
+        """Allow editing ALL fields (no restrictions for Feature 2)"""
+        # All fields are now editable
         return v
 
 
@@ -54,6 +51,7 @@ class InlineEditResponse(BaseModel):
     field_name: str
     field_value: Optional[str]
     is_edited: bool
+    is_temporary: bool
     message: str
 
 
@@ -88,12 +86,15 @@ def inline_edit_result(
     """
     Inline edit a single field in a cleaned result.
     
+    Feature 2: Full Inline Edit
+    - All fields are now editable (no restrictions)
+    - Supports temporary vs permanent edits
+    - Temporary edits stored in user_overrides JSONB column
+    - Permanent edits update main column and set is_edited=True
     - Protected by require_admin dependency
-    - Only allows editing specific fields (name, city, address, rating_overall, price_min, etc.)
-    - Validates data types (rating 0-10, price positive number)
-    - Sets is_edited flag to True
-    - Returns updated field value
     """
+    from datetime import datetime
+    
     # Find the result
     result = db.query(CleanedResult).filter(CleanedResult.id == result_id).first()
     
@@ -103,12 +104,15 @@ def inline_edit_result(
             detail="Result not found"
         )
     
-    # Validate and convert field value based on field type
     field_name = edit_request.field_name
     field_value = edit_request.field_value
+    is_temporary = edit_request.temporary
     
+    # Validate and convert field value based on field type
     try:
-        if field_name == 'rating_overall':
+        # Numeric fields
+        if field_name in ['rating_overall', 'rating_cleanliness', 'rating_location',
+                         'rating_facilities', 'rating_service', 'rating_value']:
             if field_value is not None:
                 rating = float(field_value)
                 if rating < 0 or rating > 10:
@@ -116,11 +120,11 @@ def inline_edit_result(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Rating must be between 0 and 10"
                     )
-                field_value = Decimal(str(rating))
+                field_value = Decimal(str(rating)) if not is_temporary else field_value
             else:
                 field_value = None
         
-        elif field_name == 'price_min':
+        elif field_name in ['price_min', 'price_max']:
             if field_value is not None:
                 price = float(field_value)
                 if price < 0:
@@ -128,12 +132,42 @@ def inline_edit_result(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Price must be a positive number"
                     )
-                field_value = Decimal(str(price))
+                field_value = Decimal(str(price)) if not is_temporary else field_value
             else:
                 field_value = None
         
-        # For string fields, keep as is (or None)
-        # field_value is already a string or None
+        elif field_name in ['latitude', 'longitude']:
+            if field_value is not None:
+                coord = float(field_value)
+                if field_name == 'latitude' and (coord < -90 or coord > 90):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Latitude must be between -90 and 90"
+                    )
+                if field_name == 'longitude' and (coord < -180 or coord > 180):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Longitude must be between -180 and 180"
+                    )
+                field_value = Decimal(str(coord)) if not is_temporary else field_value
+            else:
+                field_value = None
+        
+        elif field_name in ['star_rating', 'review_count', 'image_count', 'established_year']:
+            if field_value is not None:
+                field_value = int(field_value) if not is_temporary else field_value
+            else:
+                field_value = None
+        
+        # Boolean fields
+        elif field_name in ['pets_allowed', 'breakfast_available', 'includes_breakfast',
+                           'includes_taxes', 'free_cancellation', 'is_edited', 'is_duplicate']:
+            if field_value is not None:
+                field_value = field_value.lower() in ['true', '1', 'yes'] if not is_temporary else field_value
+            else:
+                field_value = None
+        
+        # String fields - keep as is
         
     except ValueError as e:
         raise HTTPException(
@@ -141,9 +175,44 @@ def inline_edit_result(
             detail=f"Invalid value for field '{field_name}': {str(e)}"
         )
     
-    # Update the field
-    setattr(result, field_name, field_value)
-    result.is_edited = True
+    if is_temporary:
+        # Store in user_overrides JSONB column
+        # Must copy the dict and use flag_modified so SQLAlchemy detects the JSONB mutation
+        overrides = dict(result.user_overrides or {})
+        overrides[field_name] = {
+            "value": field_value,
+            "temp": True,
+            "edited_by": current_user.id,
+            "edited_at": datetime.utcnow().isoformat()
+        }
+        result.user_overrides = overrides
+        flag_modified(result, "user_overrides")
+    else:
+        # Permanent: update main column and remove any temp override for this field
+        if hasattr(result, field_name):
+            setattr(result, field_name, field_value)
+            result.is_edited = True
+            result.updated_at = datetime.utcnow()
+            # Clean up any temporary override for this field
+            if result.user_overrides and field_name in result.user_overrides:
+                overrides = dict(result.user_overrides)
+                del overrides[field_name]
+                result.user_overrides = overrides
+                flag_modified(result, "user_overrides")
+        else:
+            # Permanent for a custom column: store in user_overrides with a special flag
+            # Custom columns don't exist on the model, so we store them persistently in user_overrides
+            overrides = dict(result.user_overrides or {})
+            overrides[field_name] = {
+                "value": field_value,
+                "temp": False,
+                "custom": True,
+                "edited_by": current_user.id,
+                "edited_at": datetime.utcnow().isoformat()
+            }
+            result.user_overrides = overrides
+            flag_modified(result, "user_overrides")
+            result.is_edited = True
     
     db.commit()
     db.refresh(result)
@@ -156,7 +225,8 @@ def inline_edit_result(
         "field_name": field_name,
         "field_value": response_value,
         "is_edited": result.is_edited,
-        "message": f"Field '{field_name}' updated successfully"
+        "is_temporary": is_temporary,
+        "message": f"Field '{field_name}' {'temporarily ' if is_temporary else ''}updated successfully"
     }
 
 
