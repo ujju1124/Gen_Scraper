@@ -141,7 +141,7 @@ services:
   go_scraper_1:
     container_name: go_scraper_1
     build:
-      context: ./google-maps-scraper - Copy
+      context: ./google-maps-scraper
       dockerfile: Dockerfile
     command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
     ports:
@@ -167,7 +167,7 @@ services:
   go_scraper_2:
     container_name: go_scraper_2
     build:
-      context: ./google-maps-scraper - Copy
+      context: ./google-maps-scraper
       dockerfile: Dockerfile
     command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
     ports:
@@ -193,7 +193,7 @@ services:
   go_scraper_3:
     container_name: go_scraper_3
     build:
-      context: ./google-maps-scraper - Copy
+      context: ./google-maps-scraper
       dockerfile: Dockerfile
     command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
     ports:
@@ -219,7 +219,7 @@ services:
   go_scraper_4:
     container_name: go_scraper_4
     build:
-      context: ./google-maps-scraper - Copy
+      context: ./google-maps-scraper
       dockerfile: Dockerfile
     command: ["google-maps-scraper", "-web", "-addr", ":8080", "-data-folder", "/data", "-c", "4"]
     ports:
