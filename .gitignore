@@ -236,9 +236,6 @@ backend/celerybeat-schedule
 zubdata/
 google-maps-scraper - Copy/
 
-# Google Maps Scraper (separate repository - see GOOGLE_MAPS_SCRAPER_SETUP.md)
-google-maps-scraper/
-
 # Docs folder (keep organized documentation)
 docs/
 

@@ -1,0 +1,68 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+dist/
+build/
+frontend/dist/
+frontend/build/
+
+# Environment and secrets
+.env
+.env.local
+.env.production
+
+# Database
+postgres_data/
+redis_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Temporary files
+local/
+testdata/
+
+# IDE
+.kiro/
+.vscode/
+.github/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PowerShell scripts (keep only in root)
+*.ps1
+
+# Temporary documentation
+FIELD-MAPPING-GUIDE.md
+GITHUB-SETUP.md
+INTEGRATION-SUMMARY.md
+MIXING-LANGUAGES.md
+PYTHON-INTEGRATION-COMPLETE.md
+QUICK-TEST-GUIDE.md
+RADIUS-SEARCH-SOLUTION.md
+READY-TO-SHARE.md
+SCRAPER-FIELD-COMPARISON.md
+SERPAPI-ARCHITECTURE.md
+SERPAPI-FALLBACK-TEST.md
+SERPAPI-FIX-APPLIED.md
+SHARE.md
+SIMPLE-EXPLANATION.md
+SMART-MATCHING-STRATEGY.md
+TEST-RESULTS.md
+
+# Images
+banner.png
+
+# Example files
+example-queries.txt
