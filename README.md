@@ -78,22 +78,21 @@ The **Nepal Business Intelligence Platform** automatically collects, validates, 
 
 2. **Set up Google Maps Scraper** (Required for Google Maps data collection)
    
-   The Google Maps scraper is a separate Go-based service:
+   The Google Maps scraper source code is included in the repository:
    
    ```bash
-   # Clone the scraper
-   git clone https://github.com/gosom/google-maps-scraper.git google-maps-scraper
+   # Install Go dependencies
    cd google-maps-scraper
-   
-   # Install dependencies
    go mod download
-   cd frontend && npm install && cd ..
    
-   # Configure
-   cp .env.example .env
+   # Install Node.js dependencies for frontend
+   cd frontend
+   npm install
+   cd ../..
+   
+   # Configure environment
+   cp google-maps-scraper/.env.example google-maps-scraper/.env
    # Edit .env and add SERPAPI_API_KEY (optional)
-   
-   cd ..
    ```
    
    📖 **See [GOOGLE_MAPS_SCRAPER_SETUP.md](./GOOGLE_MAPS_SCRAPER_SETUP.md) for detailed instructions**
