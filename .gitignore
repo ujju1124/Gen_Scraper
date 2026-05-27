@@ -235,6 +235,7 @@ backend/celerybeat-schedule
 
 # Reference code (not part of project)
 zubdata/
+google-maps-scraper/
 google-maps-scraper - Copy/
 
 # Docs folder (keep organized documentation)
