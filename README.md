@@ -62,6 +62,9 @@ The **Nepal Business Intelligence Platform** automatically collects, validates, 
 ### Prerequisites
 
 - Docker Desktop
+- Python 3.11+
+- **Go 1.21+** (for Google Maps scraper)
+- **Node.js 18+** (for Google Maps scraper frontend)
 - 8GB RAM minimum
 - 10GB free disk space
 
@@ -73,23 +76,69 @@ The **Nepal Business Intelligence Platform** automatically collects, validates, 
    cd Gen_Scraper
    ```
 
-2. **Configure environment**
+2. **Set up Google Maps Scraper** (Required for Google Maps data collection)
+   
+   The Google Maps scraper is a separate Go-based service:
+   
+   ```bash
+   # Clone the scraper
+   git clone https://github.com/gosom/google-maps-scraper.git google-maps-scraper
+   cd google-maps-scraper
+   
+   # Install dependencies
+   go mod download
+   cd frontend && npm install && cd ..
+   
+   # Configure
+   cp .env.example .env
+   # Edit .env and add SERPAPI_API_KEY (optional)
+   
+   cd ..
+   ```
+   
+   📖 **See [GOOGLE_MAPS_SCRAPER_SETUP.md](./GOOGLE_MAPS_SCRAPER_SETUP.md) for detailed instructions**
+
+3. **Configure environment**
    ```bash
    cp .env.example .env
    # Edit .env with your configuration
    ```
 
-3. **Start the platform**
+4. **Start the platform**
    ```bash
    docker-compose up -d
    ```
 
-4. **Access the application**
+5. **Start Google Maps Scraper** (3 separate terminals)
+   
+   **Terminal 1 - Backend:**
+   ```bash
+   cd google-maps-scraper
+   .\start-dev.ps1
+   # Wait for "Admin user created successfully" then Ctrl+C once
+   ```
+   
+   **Terminal 2 - Worker:**
+   ```bash
+   cd google-maps-scraper
+   .\start-worker.ps1
+   # Keep running
+   ```
+   
+   **Terminal 3 - Frontend (Optional):**
+   ```bash
+   cd google-maps-scraper/frontend
+   npm run dev
+   # Keep running
+   ```
+
+6. **Access the application**
    - Frontend: http://localhost:5173
    - Backend API: http://localhost:8000
    - API Docs: http://localhost:8000/docs
+   - Google Maps Scraper UI: http://localhost:3001 (optional)
 
-5. **Default credentials**
+7. **Default credentials**
    - Email: `admin@example.com`
    - Password: Check `.env` file for `ADMIN_PASSWORD`
    - ⚠️ **Change default password immediately after first login**
