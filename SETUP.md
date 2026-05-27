@@ -2,7 +2,7 @@
 
 ## Welcome! 👋
 
-This guide will help you set up Gen_Scraper from scratch on a **completely fresh laptop**. We'll install everything you need step-by-step.
+This guide will help you set up Gen_Scraper from scratch. We'll install everything you need step-by-step.
 
 **Total Time:** About 45 minutes  
 **Difficulty:** Beginner-friendly  
@@ -581,8 +581,8 @@ Let's create a test scraping job to make sure everything works:
 - **Main Application:** http://localhost:5173
 - **API Documentation:** http://localhost:8000/docs
 - **Database Admin:** http://localhost:5050
-  - Email: admin@admin.com
-  - Password: admin
+  - Email: admin@admin.com or your own email in .env
+  - Password: admin or your own password
 
 ### Features:
 - ✅ Create scraping jobs
