@@ -73,6 +73,10 @@ class GoogleMapsScraper(BaseScraper):
             max_results=max_results,
             go_enabled=settings.GO_SCRAPER_ENABLED,
         )
+        
+        # DEBUG: Force log to see if this code path is reached
+        print(f"[DEBUG] google_maps.run() called - location={location}, go_enabled={settings.GO_SCRAPER_ENABLED}")
+        logger.info("DEBUG_RUN_CALLED", location=location, go_enabled=settings.GO_SCRAPER_ENABLED)
 
         # ── Tier 1: Go scraper ──────────────────────────────────────────
         if settings.GO_SCRAPER_ENABLED:
@@ -140,7 +144,18 @@ class GoogleMapsScraper(BaseScraper):
                 remaining_needed=remaining_needed
             )
         
-        playwright_results = await super().run(source, db, location, remaining_needed or max_results, category_id)
+        # Resolve category for neighborhood-aware fallback
+        category = await self._resolve_category(db, category_id)
+        
+        # Use neighborhood-aware Playwright fallback to avoid cross-city contamination
+        playwright_results = await self._run_playwright_with_neighborhoods(
+            source=source,
+            db=db,
+            location=location,
+            category=category,
+            max_results=remaining_needed or max_results,
+            category_id=category_id
+        )
         
         # Combine results: Go scraper + Playwright
         if go_scraper_results and playwright_results:
@@ -149,7 +164,16 @@ class GoogleMapsScraper(BaseScraper):
             combined_results = []
             
             for result in go_scraper_results + playwright_results:
-                key = (result.get("name", "").lower(), result.get("address", "").lower())
+                # Skip None results
+                if result is None:
+                    logger.warning("google_maps.none_result_skipped", location=location)
+                    continue
+                
+                # Safely get name and address with None handling
+                name = result.get("name") or ""
+                address = result.get("address") or ""
+                key = (name.lower(), address.lower())
+                
                 if key not in seen and key != ("", ""):
                     seen.add(key)
                     combined_results.append(result)
@@ -168,6 +192,26 @@ class GoogleMapsScraper(BaseScraper):
             results = go_scraper_results
         else:
             results = playwright_results
+        
+        # Apply geographic filtering to remove results from wrong city
+        from scrapers.geo_filter import filter_results_by_city
+        
+        original_count = len(results)
+        results, removed = filter_results_by_city(
+            results=results,
+            city=location,
+            strict=False  # Keep results without coords
+        )
+        
+        # Always log geographic filtering for visibility
+        logger.info(
+            "google_maps.geo_filtered",
+            location=location,
+            original=original_count,
+            after_filter=len(results),
+            removed=removed,
+            message=f"Geographic filtering: {removed} removed, {len(results)} kept"
+        )
         
         # Update progress: Completed
         if job and results:
@@ -219,50 +263,44 @@ class GoogleMapsScraper(BaseScraper):
         geo_coordinates = settings_dict.get("geo_coordinates") or self._get_geo_coordinates(location)
 
         # Derive max_depth from settings or max_results
-        # Dynamic formula: adjusts depth based on desired result count
+        # The Go scraper now scrolls until no more results are found (3 consecutive scrolls with no change)
+        # maxDepth is just a safety limit to prevent infinite scrolling
+        # We set it very high so the "no more results" detection kicks in first
         max_depth = settings_dict.get("max_depth")
         if max_depth is None:
             if max_results:
-                # Dynamic formula based on max_results
-                # Each scroll/depth typically yields 5-15 results depending on location
-                # We use a conservative estimate of 8 results per depth
-                # Add 20% buffer to ensure we get enough results
+                # Set maxDepth high enough to never hit the limit
+                # The Go scraper will stop automatically when no more results load
+                # Google Maps limit is ~120 results per search anyway
                 
-                if max_results <= 20:
-                    # Small requests: 10-20 results
-                    # Formula: (results / 8) + 2 buffer
-                    max_depth = max(5, (max_results // 8) + 2)
+                if max_results <= 25:
+                    # Small requests: depth 10 is plenty
+                    # Google Maps loads ~20 results per scroll
+                    max_depth = 10
                 elif max_results <= 50:
-                    # Medium requests: 21-50 results
-                    # Formula: (results / 8) + 3 buffer
-                    max_depth = (max_results // 8) + 3
+                    # Small-medium requests: use depth 20
+                    max_depth = 20
                 elif max_results <= 100:
-                    # Large requests: 51-100 results
-                    # Formula: (results / 8) + 5 buffer
-                    max_depth = (max_results // 8) + 5
-                elif max_results <= 200:
-                    # Very large requests: 101-200 results
-                    # Formula: (results / 10) + 8 buffer
-                    max_depth = (max_results // 10) + 8
+                    # Large requests: use depth 50
+                    max_depth = 50
                 else:
-                    # Huge requests: 200+ results
-                    # Formula: (results / 10) + 10 buffer, capped at 100
-                    max_depth = min(100, (max_results // 10) + 10)
+                    # Very large requests: use max depth 80
+                    max_depth = 80
                 
                 logger.info(
                     "google_maps.max_depth_calculated",
                     max_results=max_results,
                     max_depth=max_depth,
-                    estimated_results=max_depth * 8
+                    note="Go scraper will auto-stop when no more results load (3 consecutive scrolls with no change)"
                 )
             else:
-                # For unlimited scraping (max_results=None), use high depth
-                # This will scrape 500-1000+ results depending on location
+                # For unlimited scraping (max_results=None), use max depth
+                # Will scrape until Google's ~120 result limit or no more results
                 max_depth = 100
                 logger.info(
                     "google_maps.max_depth_unlimited",
                     max_depth=max_depth,
-                    estimated_results="500-1000+"
+                    note="Will scrape until no more results load (up to Google's ~120 limit)"
                 )
 
         # Get other settings with defaults
@@ -283,17 +321,56 @@ class GoogleMapsScraper(BaseScraper):
             max_results=max_results,
         )
 
-        results = await self._go_client.scrape(
-            keyword=keyword,
-            geo_coordinates=geo_coordinates,
-            zoom=zoom,
-            max_depth=max_depth,
-            radius=radius,
-            lang=lang,
-            extract_emails=extract_emails,
-            extra_reviews=extra_reviews,
-            fast_mode=fast_mode,
+        CHUNK_THRESHOLD = 150
+        
+        # DEBUG: Log routing decision
+        logger.info(
+            "google_maps.routing_decision",
+            max_results=max_results,
+            threshold=CHUNK_THRESHOLD,
+            will_use_large=bool(max_results and max_results > CHUNK_THRESHOLD),
+            location=location,
+            keyword=keyword
         )
+        
+        # Use neighborhood search or chunking for large jobs (>150 results)
+        if max_results and max_results > CHUNK_THRESHOLD:
+            logger.info(
+                "go_scraper.using_large_job_strategy",
+                max_results=max_results,
+                keyword=keyword,
+                location=location,
+                reason=f"Large job (>{CHUNK_THRESHOLD} results) - using neighborhood search or chunking"
+            )
+            results = await self._go_client.scrape_large(
+                keyword=keyword,
+                total_results=max_results,
+                location=location,
+                geo_coordinates=geo_coordinates,
+                zoom=zoom,
+                radius=radius,
+                lang=lang,
+                extract_emails=extract_emails,
+            )
+        else:
+            # Single mode for small/medium jobs (≤150 results)
+            logger.info(
+                "go_scraper.using_single_mode",
+                max_results=max_results,
+                keyword=keyword,
+                reason=f"Small/medium job (≤{CHUNK_THRESHOLD} results) - using single mode"
+            )
+            results = await self._go_client.scrape(
+                keyword=keyword,
+                geo_coordinates=geo_coordinates,
+                zoom=zoom,
+                max_depth=max_depth,
+                radius=radius,
+                lang=lang,
+                extract_emails=extract_emails,
+                extra_reviews=extra_reviews,
+                fast_mode=fast_mode,
+            )
 
         # Update progress: Go scraper completed
         if job and results:
@@ -331,6 +408,111 @@ class GoogleMapsScraper(BaseScraper):
             results = results[:max_results]
 
         return results
+
+    async def _run_playwright_with_neighborhoods(
+        self,
+        source: Source,
+        db: Session,
+        location: str,
+        category: str,
+        max_results: int,
+        category_id: int
+    ) -> list[dict]:
+        """
+        Playwright fallback that uses neighborhood keywords to avoid cross-city contamination.
+        
+        Instead of searching "restaurants in Bhaktapur" (which returns nearby Kathmandu results),
+        this searches "restaurants in Durbar Square, Bhaktapur" for each neighborhood.
+        """
+        from scrapers.go_scraper_client import NEIGHBORHOOD_KEYWORDS
+        
+        neighborhoods = NEIGHBORHOOD_KEYWORDS.get(location.lower(), [])
+        
+        if not neighborhoods:
+            # Unknown city - use standard search but filter results afterward
+            logger.info(
+                "playwright.no_neighborhoods",
+                location=location,
+                message="No neighborhoods defined, using standard search"
+            )
+            return await super().run(source, db, location, max_results, category_id)
+        
+        # Use first 2-3 neighborhoods for Playwright (Playwright is slower, don't use all)
+        max_neighborhoods = min(3, len(neighborhoods))
+        selected = neighborhoods[:max_neighborhoods]
+        
+        logger.info(
+            "playwright.neighborhood_search",
+            location=location,
+            total_neighborhoods=len(neighborhoods),
+            selected_neighborhoods=selected,
+            max_results=max_results
+        )
+        
+        all_results = []
+        seen_keys = set()  # Track (name, address) to avoid duplicates
+        
+        for neighborhood in selected:
+            if len(all_results) >= max_results:
+                break
+            
+            # Use neighborhood-specific keyword
+            neighborhood_location = f"{neighborhood}, {location}"
+            remaining = max_results - len(all_results)
+            
+            logger.info(
+                "playwright.searching_neighborhood",
+                neighborhood=neighborhood,
+                location=location,
+                remaining=remaining
+            )
+            
+            try:
+                # Call parent's run() method which will use _scrape()
+                results = await super().run(
+                    source,
+                    db,
+                    neighborhood_location,
+                    min(remaining, 30),  # Small batches per neighborhood
+                    category_id
+                )
+                
+                # Deduplicate results
+                for result in results:
+                    if result is None:
+                        continue
+                    
+                    name = result.get("name") or ""
+                    address = result.get("address") or ""
+                    key = (name.lower(), address.lower())
+                    
+                    if key not in seen_keys and key != ("", ""):
+                        seen_keys.add(key)
+                        all_results.append(result)
+                
+                logger.info(
+                    "playwright.neighborhood_complete",
+                    neighborhood=neighborhood,
+                    results_found=len(results),
+                    total_unique=len(all_results)
+                )
+                
+            except Exception as e:
+                logger.warning(
+                    "playwright.neighborhood_failed",
+                    neighborhood=neighborhood,
+                    error=str(e)
+                )
+                continue
+        
+        logger.info(
+            "playwright.neighborhood_search_complete",
+            location=location,
+            neighborhoods_searched=len(selected),
+            total_results=len(all_results)
+        )
+        
+        return all_results[:max_results]
 
     # ------------------------------------------------------------------
     # Playwright fallback tier (original implementation)
@@ -424,6 +606,8 @@ class GoogleMapsScraper(BaseScraper):
     @staticmethod
     def _get_geo_coordinates(location: str) -> str:
         """Return lat,lon string for a city name, or empty string if unknown."""
+        if not location:
+            return ""
         return CITY_COORDINATES.get(location.lower().strip(), "")
 
     @staticmethod

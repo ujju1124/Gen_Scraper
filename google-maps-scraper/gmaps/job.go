@@ -317,10 +317,12 @@ func scroll(ctx context.Context,
 	// Scroll to the bottom of the page.
 	waitTime := 100.
 	cnt := 0
+	noChangeCount := 0  // Track consecutive scrolls with no height change
 
 	const (
 		timeout  = 500
 		maxWait2 = 2000
+		maxNoChangeAttempts = 3  // Stop after 3 consecutive scrolls with no change
 	)
 
 	for i := 0; i < maxDepth; i++ {
@@ -348,11 +350,19 @@ func scroll(ctx context.Context,
 			return cnt, fmt.Errorf("scrollHeight is not a number, got %T", scrollHeight)
 		}
 
+		// Check if height changed
 		if height == currentScrollHeight {
-			break
+			noChangeCount++
+			// Stop only after multiple consecutive scrolls with no change
+			// This gives Google Maps time to load more results
+			if noChangeCount >= maxNoChangeAttempts {
+				break
+			}
+		} else {
+			// Height changed, reset counter
+			noChangeCount = 0
+			currentScrollHeight = height
 		}
-
-		currentScrollHeight = height
 
 		select {
 		case <-ctx.Done():

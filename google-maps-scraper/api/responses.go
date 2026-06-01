@@ -103,8 +103,8 @@ func (r *ScrapeRequest) Validate() error {
 		return fmt.Errorf("max_depth must be between 0 and 100")
 	}
 
-	if r.Timeout < 1 || r.Timeout > 300 {
-		return fmt.Errorf("timeout must be between 1 and 300 seconds")
+	if r.Timeout < 1 || r.Timeout > 3600 {
+		return fmt.Errorf("timeout must be between 1 and 3600 seconds")
 	}
 
 	return nil

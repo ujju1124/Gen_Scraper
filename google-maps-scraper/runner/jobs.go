@@ -87,7 +87,11 @@ func CreateSeedJobs(
 
 		var job scrapemate.IJob
 
-		if !fastmode {
+		// EMERGENCY FIX: Force slow mode - fast mode CSV export is broken in original code
+		// Fast mode (SearchJob) finds places but produces 0-byte CSV files
+		// Slow mode (GmapJob) works correctly and produces valid CSV output
+		// if !fastmode {
+		if true {  // Always use slow mode (GmapJob)
 			opts := []gmaps.GmapJobOptions{}
 
 			if dedup != nil {
@@ -122,6 +126,9 @@ func CreateSeedJobs(
 			if exitMonitor != nil {
 				opts = append(opts, gmaps.WithSearchJobExitMonitor(exitMonitor))
 			}
+
+			// CRITICAL: Enable WriterManagedCompletion so results flow to ResultWriter
+			opts = append(opts, gmaps.WithSearchJobWriterManagedCompletion())
 
 			job = gmaps.NewSearchJob(&jparams, opts...)
 		}

@@ -318,7 +318,11 @@ class ScraperOrchestrator:
                     if "directoryofnepal" in source.name:
                         timeout_seconds = 1800.0  # 30 minutes for Directory of Nepal
                     elif source.name == "google_maps":
-                        timeout_seconds = 1200.0  # 20 minutes for Google Maps
+                        timeout_seconds = 3600.0  # 60 minutes for Google Maps
+                        # Kathmandu: 12 neighbourhoods → 3 batches × ~8 min = ~24 min
+                        # Pokhara:    9 neighbourhoods → 3 batches × ~8 min = ~24 min
+                        # Plus browser startup (~2 min) + dedup + buffer = ~30 min total
+                        # 60 min gives comfortable headroom for any city
                     else:
                         timeout_seconds = 900.0   # 15 minutes for all other scrapers (Booking.com etc.)
                     

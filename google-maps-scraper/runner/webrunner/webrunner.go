@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gosom/google-maps-scraper/deduper"
@@ -23,6 +24,31 @@ import (
 	"github.com/gosom/scrapemate/scrapemateapp"
 	"golang.org/x/sync/errgroup"
 )
+
+// syncWriter wraps an io.Writer and syncs after every write
+// This ensures data is flushed to disk immediately
+type syncWriter struct {
+	w io.Writer
+	f *os.File
+	mu sync.Mutex
+}
+
+func (s *syncWriter) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	n, err = s.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	
+	// Sync to disk after every write
+	if s.f != nil {
+		_ = s.f.Sync()
+	}
+	
+	return n, nil
+}
 
 type webrunner struct {
 	srv *web.Server
@@ -155,7 +181,7 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		_ = outfile.Close()
 	}()
 
-	mate, err := w.setupMate(ctx, outfile, job)
+	mate, err := w.setupMate(ctx, outfile, job, outfile)
 	if err != nil {
 		job.Status = web.StatusFailed
 
@@ -242,17 +268,42 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		cancel()
 	}
 
-	mate.Close()
+	log.Printf("job %s: after cancel(), about to sync file", job.ID)
 
+	// mate.Close() is called by defer, no need to call it explicitly here
+	// Calling it twice can cause blocking issues
+
+	// Sync the file to disk to ensure OS buffers are flushed
+	if err := outfile.Sync(); err != nil {
+		log.Printf("warning: failed to sync file for job %s: %v", job.ID, err)
+	}
+
+	log.Printf("job %s: scraping completed, updating status to ok", job.ID)
 	job.Status = web.StatusOK
 
-	return w.svc.Update(ctx, job)
+	// Use context.Background() for the final status update.
+	// The job's mateCtx is already cancelled at this point (by the exiter or timeout),
+	// and the outer ctx may also be done. We must persist the "ok" status regardless.
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer updateCancel()
+
+	if err := w.svc.Update(updateCtx, job); err != nil {
+		log.Printf("error: failed to update job %s status to ok: %v", job.ID, err)
+		return err
+	}
+
+	log.Printf("job %s completed successfully and status updated to ok", job.ID)
+	return nil
 }
 
-func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job) (*scrapemateapp.ScrapemateApp, error) {
+func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job, outfile *os.File) (*scrapemateapp.ScrapemateApp, error) {
 	opts := []func(*scrapemateapp.Config) error{
 		scrapemateapp.WithConcurrency(w.cfg.Concurrency),
-		scrapemateapp.WithExitOnInactivity(time.Minute * 3),
+		// NOTE: WithExitOnInactivity intentionally removed.
+		// The web runner uses context.WithTimeout (allowedSeconds) for job time limits.
+		// The inactivity monitor fires when no job *completes* within the window —
+		// but GmapJob is a single long-running scroll job (5-10 min), so lastActivityAt
+		// stays at zero and the monitor kills the scraper before any PlaceJobs run.
 	}
 
 	if !job.Data.FastMode {
@@ -286,7 +337,9 @@ func (w *webrunner) setupMate(_ context.Context, writer io.Writer, job *web.Job)
 
 	log.Printf("job %s has proxy: %v", job.ID, hasProxy)
 
-	csvWriter := csvwriter.NewCsvWriter(csv.NewWriter(writer))
+	// Wrap the writer with syncWriter to ensure every write is synced to disk
+	syncingWriter := &syncWriter{w: writer, f: outfile}
+	csvWriter := csvwriter.NewCsvWriter(csv.NewWriter(syncingWriter))
 
 	writers := []scrapemate.ResultWriter{csvWriter}
 

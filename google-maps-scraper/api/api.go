@@ -39,7 +39,7 @@ func NewAppState(rqueue *rqueue.Client, store IStore) *AppState {
 func Routes(r chi.Router, appState *AppState) {
 	r.Use(httpext.LoggingMiddleware)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(120 * time.Second))
+	r.Use(middleware.Timeout(3600 * time.Second))
 	r.Use(KeyAuth(appState.Store.ValidateAPIKey))
 
 	r.Route("/api/v1", func(r chi.Router) {

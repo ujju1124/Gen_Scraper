@@ -31,6 +31,9 @@ celery_app = Celery(
     backend=settings.REDIS_URL
 )
 
+# Alias for Celery CLI compatibility
+app = celery_app
+
 # Configure Celery
 celery_app.conf.update(
     task_serializer="json",

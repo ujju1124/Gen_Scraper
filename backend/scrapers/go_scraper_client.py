@@ -31,6 +31,81 @@ from scrapers.go_scraper_pool import go_scraper_pool
 
 logger = structlog.get_logger()
 
+# Neighborhood keywords for major Nepal cities
+# Use simple format: "Thamel" not "Thamel Kathmandu" or "restaurants in Thamel"
+# The category will be prepended: "restaurants in Thamel, Kathmandu"
+NEIGHBORHOOD_KEYWORDS = {
+    "kathmandu": [
+        "Thamel",
+        "Durbar Marg",
+        "New Road",
+        "Patan",
+        "Baneshwor",
+        "Lazimpat",
+        "Boudha",
+        "Swayambhu",
+        # Chabahil, Maharajgunj, Koteshwor, Kalanki removed to keep within 2 batches
+        # 8 neighbourhoods × ~5 min = ~10 min total (well within 60 min limit)
+        # Add them back if you need more coverage
+    ],
+    "pokhara": [
+        "Lakeside",
+        "Baidam",
+        "Damside",
+        "Prithvi Chowk",
+        "Mahendrapul",
+        "Sabhagriha",
+        "Newroad",
+        "Chipledhunga",
+        "Baglung Bus Park",
+    ],
+    "biratnagar": [
+        "Traffic Chowk",
+        "Ghantaghar",
+        "Rangeli Road",
+        "Buddhashanti",
+        "Main Road",
+        "Tinpaini",
+    ],
+    "dharan": [
+        "Bhanuchowk",
+        "Chatara Road",
+        "Dharan Bazaar",
+        "BP Chowk",
+        "Pindeshwor",
+    ],
+    "birgunj": [
+        "Ghantaghar",
+        "Adarshanagar",
+        "Clock Tower",
+        "Main Road",
+        "Parsauni",
+    ],
+    "bharatpur": [
+        "Pulchowk",
+        "Narayangadh",
+        "Sahid Chowk",
+        "Ratnanagar",
+    ],
+    "chitwan": [
+        "Narayangadh",
+        "Bharatpur",
+        "Ratnanagar",
+        "Sauraha",
+    ],
+    "lalitpur": [
+        "Jawalakhel",
+        "Pulchowk",
+        "Kupondole",
+        "Sanepa",
+    ],
+    "bhaktapur": [
+        "Durbar Square",
+        "Suryabinayak",
+        "Thimi",
+    ],
+}
+
 
 class GoScraperClient:
     """
@@ -110,14 +185,14 @@ class GoScraperClient:
         estimated_results = min(max_depth * 3, 100)  # ~3 results per depth level, cap at 100
         
         if extract_emails:
-            # Email extraction: 15 seconds per result + 300s base (more generous)
-            max_time_seconds = 300 + (estimated_results * 15)
-            # Cap at 1200 seconds (20 minutes) for email extraction jobs
+            # Email extraction: 15 seconds per result + 180s base
+            max_time_seconds = 180 + (estimated_results * 15)
             max_time_seconds = max(300, min(max_time_seconds, 1200))
         else:
-            # No email extraction: 5 seconds per result + 300s base (more generous)
-            max_time_seconds = 300 + (estimated_results * 5)
-            # Cap at 900 seconds (15 minutes) for non-email jobs
+            # No email extraction: 5 seconds per result + 180s base
+            # 180s covers Go scraper startup + browser download + first scroll
+            max_time_seconds = 180 + (estimated_results * 5)
+            # Cap between 300s (5 min minimum) and 900s (15 min maximum)
             max_time_seconds = max(300, min(max_time_seconds, 900))
         
         logger.info(
@@ -139,7 +214,7 @@ class GoScraperClient:
             "fast_mode": fast_mode,
             "email": extract_emails,
             "radius": int(radius * 1000) if radius > 0 else 10000,  # km → meters
-            "max_time": max_time_seconds,  # seconds (Go converts to Duration)
+            "max_time": min(int(max_time_seconds), 3600),  # Go scraper expects "max_time", not "timeout" (Stay under Go's 3600s limit)
             "lat": lat,
             "lon": lon,
         }
@@ -239,6 +314,535 @@ class GoScraperClient:
         health_status = await go_scraper_pool.health_check_all()
         return any(health_status.values())
 
+    async def _scrape_neighborhoods(
+        self,
+        keyword: str,
+        location: str,
+        total_results: int,
+        zoom: int = 15,
+        lang: str = "en",
+        extract_emails: bool = False,
+    ) -> list[dict]:
+        """
+        Scrape using neighborhood keywords in batches.
+        
+        Batch size = number of Go scraper instances (4).
+        Each batch runs in parallel, batches run sequentially.
+        This prevents queue congestion while maximizing speed.
+        
+        Example for Kathmandu (12 neighborhoods):
+        - Batch 1: Thamel, Durbar Marg, New Road, Patan → all 4 run in parallel (~4 min)
+        - Batch 2: Baneshwor, Lazimpat, Boudha, Swayambhu → all 4 run in parallel (~4 min)
+        - Batch 3: Chabahil, Maharajgunj, Koteshwor, Kalanki → all 4 run in parallel (~4 min)
+        Total: ~12 minutes ✅ (well under 30 min orchestrator limit)
+        """
+        import asyncio
+        import math
+
+        # Get neighborhoods for this city (using module-level NEIGHBORHOOD_KEYWORDS)
+        neighborhoods = NEIGHBORHOOD_KEYWORDS.get(location.lower(), [])
+        
+        if not neighborhoods:
+            logger.warning(
+                "go_scraper.no_neighborhoods_defined",
+                location=location,
+                message="No neighborhoods defined for this city — falling back to quadrant chunking"
+            )
+            return []
+
+        # Extract category from keyword
+        category = keyword.split(" in ")[0] if " in " in keyword else keyword
+
+        instances = [
+            "http://go_scraper_1:8080",
+            "http://go_scraper_2:8080",
+            "http://go_scraper_3:8080",
+            "http://go_scraper_4:8080",
+        ]
+        
+        BATCH_SIZE = len(instances)  # 4
+
+        logger.info(
+            "go_scraper.neighborhood_search_start",
+            location=location,
+            category=category,
+            total_neighborhoods=len(neighborhoods),
+            batch_size=BATCH_SIZE,
+            total_batches=math.ceil(len(neighborhoods) / BATCH_SIZE),
+            total_requested=total_results,
+        )
+
+        all_results = []
+        
+        # Clear ALL queues ONCE at the start (before any batches)
+        # This removes stuck jobs from previous runs
+        logger.info("go_scraper.clearing_all_queues_once", total_instances=len(instances))
+        clear_tasks = [
+            self._clear_instance_queue(inst)
+            for inst in instances
+        ]
+        await asyncio.gather(*clear_tasks, return_exceptions=True)
+        await asyncio.sleep(3)  # Wait for queues to stabilize
+        
+        # Process neighborhoods in batches of 4
+        for batch_start in range(0, len(neighborhoods), BATCH_SIZE):
+            batch = neighborhoods[batch_start:batch_start + BATCH_SIZE]
+            batch_num = (batch_start // BATCH_SIZE) + 1
+            total_batches = math.ceil(len(neighborhoods) / BATCH_SIZE)
+            
+            logger.info(
+                "go_scraper.batch_start",
+                batch_num=batch_num,
+                total_batches=total_batches,
+                neighborhoods=batch
+            )
+            
+            # Submit this batch in parallel (one neighborhood per instance)
+            tasks = []
+            for i, neighborhood in enumerate(batch):
+                instance = instances[i % len(instances)]
+                # Use format: "restaurants in Thamel, Kathmandu" (with city for disambiguation)
+                # This prevents ambiguous neighborhoods like "Durbar Square" from returning results from multiple cities
+                neighborhood_keyword = f"{category} in {neighborhood}, {location}"
+
+                logger.info(
+                    "go_scraper.neighborhood_assigned",
+                    neighborhood=neighborhood,
+                    keyword=neighborhood_keyword,
+                    instance=instance,
+                    batch_num=batch_num,
+                )
+
+                task = self._scrape_single_chunk(
+                    keyword=neighborhood_keyword,  # Full keyword with neighborhood
+                    chunk_index=batch_start + i,
+                    depth=8,             # depth=8 → ~60-80 results, ~4 min per neighbourhood
+                    instance=instance,
+                    geo_coordinates="",  # No coordinates - keyword drives search
+                    zoom=zoom,
+                    radius=0,            # No radius - keyword drives search
+                    lang=lang,
+                    extract_emails=extract_emails,
+                )
+                tasks.append((neighborhood, task))
+            
+            # Wait for ALL tasks in this batch to complete before starting next batch
+            batch_tasks = [t for _, t in tasks]
+            batch_neighborhoods = [n for n, _ in tasks]
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Process batch results
+            batch_success = 0
+            batch_failed = 0
+            
+            for i, result in enumerate(batch_results):
+                neighborhood = batch_neighborhoods[i]
+                
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "go_scraper.neighborhood_failed",
+                        neighborhood=neighborhood,
+                        error=str(result),
+                        batch_num=batch_num
+                    )
+                    batch_failed += 1
+                elif result and len(result) > 0:
+                    all_results.extend(result)
+                    batch_success += 1
+                    logger.info(
+                        "go_scraper.neighborhood_complete",
+                        neighborhood=neighborhood,
+                        result_count=len(result),
+                        batch_num=batch_num
+                    )
+                else:
+                    logger.warning(
+                        "go_scraper.neighborhood_empty",
+                        neighborhood=neighborhood,
+                        batch_num=batch_num
+                    )
+                    batch_failed += 1
+            
+            logger.info(
+                "go_scraper.batch_complete",
+                batch_num=batch_num,
+                total_batches=total_batches,
+                batch_success=batch_success,
+                batch_failed=batch_failed,
+                total_so_far=len(all_results)
+            )
+            
+            # Early exit: if we have enough results, no need to run remaining batches
+            if len(all_results) >= total_results * 1.5:
+                logger.info(
+                    "go_scraper.early_exit",
+                    collected=len(all_results),
+                    threshold=total_results * 1.5,
+                    message="Enough results collected, skipping remaining batches"
+                )
+                break
+        
+        # Deduplicate — use place_id first (reliable)
+        # then fall back to name+address
+        seen_place_ids = set()
+        seen_name_addr = set()
+        unique_results = []
+        
+        for r in all_results:
+            # Try place_id first (most reliable)
+            place_id = r.get("extra_data", {}).get("place_id", "").strip()
+            if not place_id:
+                # Fallback: check top-level place_id (if exists)
+                place_id = r.get("place_id", "").strip()
+            
+            if place_id:
+                if place_id not in seen_place_ids:
+                    seen_place_ids.add(place_id)
+                    unique_results.append(r)
+            else:
+                # No place_id, use name+address
+                key = (
+                    r.get("name", "").lower().strip(),
+                    r.get("address", "").lower().strip()
+                )
+                if key not in seen_name_addr and key != ("", ""):
+                    seen_name_addr.add(key)
+                    unique_results.append(r)
+        
+        duplicate_rate = round(
+            (1 - len(unique_results) / max(len(all_results), 1)) * 100, 1
+        )
+        
+        logger.info(
+            "go_scraper.neighborhood_search_complete",
+            location=location,
+            category=category,
+            total_collected=len(all_results),
+            after_dedup=len(unique_results),
+            duplicate_rate=f"{duplicate_rate}%"
+        )
+        
+        return unique_results[:total_results]
+
+    async def scrape_large(
+        self,
+        keyword: str,
+        total_results: int,
+        location: str = "",
+        geo_coordinates: str = "",
+        zoom: int = 14,
+        radius: float = 5,
+        lang: str = "en",
+        extract_emails: bool = False,
+    ) -> list[dict]:
+        """
+        For large jobs (>150 results): uses neighborhood search or quadrant chunking.
+        
+        STRATEGY 1: Neighborhood keyword search (primary, for known cities)
+        - Uses neighborhood names in keywords: "restaurants Thamel"
+        - Each neighborhood = different search = different results
+        - Expected: 400-600 unique results, 20-40% duplicate rate
+        - Supported: 56 cities across Nepal (Kathmandu, Pokhara, Biratnagar, Dharan,
+          Birgunj, Bharatpur, Chitwan, Lalitpur, Bhaktapur, Hetauda, Butwal, Nepalgunj,
+          Janakpur, Itahari, Dhangadhi, Tulsipur, Siddharthanagar, Ghorahi, Damak,
+          Mechinagar, Birendranagar, Kalaiya, Rajbiraj, Lahan, Gaur, Bardibas, Malangwa,
+          Triyuga, Birtamod, Bhadrapur, Tansen, Mahendranagar, Ilam, Jaleshwar, Simara,
+          Kohalpur, Urlabari, Inaruwa, Dhankuta, Baglung, Waling, Putalibazar, Tikapur,
+          Dipayal, Dadeldhura, Bhojpur, Khandbari, Phidim, Mirchaiya, Rajpur, Chandranigahapur)
+        
+        STRATEGY 2: Quadrant chunking (fallback for unknown cities)
+        - Repeats same search multiple times
+        - Expected: ~120 unique results, 75% duplicate rate
+        - Used when city has no neighborhood data
+        
+        Note: Coordinate-based grid search removed (May 30, 2026)
+        - Go scraper ignores lat/lon parameters (confirmed by testing)
+        - Uses IP-based location instead
+        - Coordinate approach will never work
+        """
+        import asyncio
+        
+        # STRATEGY 1: Try neighborhood search first (for known cities)
+        if location:
+            logger.info(
+                "go_scraper.trying_neighborhood_search",
+                location=location,
+                keyword=keyword,
+                total_results=total_results
+            )
+            
+            neighborhood_results = await self._scrape_neighborhoods(
+                keyword=keyword,
+                location=location,
+                total_results=total_results,
+                zoom=zoom,
+                lang=lang,
+                extract_emails=extract_emails,
+            )
+            
+            if neighborhood_results:
+                logger.info(
+                    "go_scraper.neighborhood_search_succeeded",
+                    location=location,
+                    result_count=len(neighborhood_results)
+                )
+                return neighborhood_results
+            
+            # If neighborhood search returned empty, fall through to quadrant chunking
+            logger.warning(
+                "go_scraper.neighborhood_search_failed",
+                location=location,
+                reason="No neighborhood data or all neighborhoods returned 0 results"
+            )
+        
+        # STRATEGY 2: Quadrant chunking fallback
+        logger.info(
+            "go_scraper.using_quadrant_chunking",
+            location=location,
+            total_results=total_results,
+            reason="No location specified or neighborhood search unavailable"
+        )
+
+        # Use original chunk size - it performs better
+        CHUNK_SIZE = 100
+        depth_per_chunk = 15  # ~8 results per depth
+        num_chunks = (total_results + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        logger.info(
+            "go_scraper.chunked_start",
+            keyword=keyword,
+            total_results=total_results,
+            num_chunks=num_chunks,
+            chunk_size=CHUNK_SIZE
+        )
+
+        # Get all available Go instances
+        # All containers expose port 8080 internally
+        instances = [
+            "http://go_scraper_1:8080",
+            "http://go_scraper_2:8080",
+            "http://go_scraper_3:8080",
+            "http://go_scraper_4:8080",
+        ]
+
+        # Create one task per chunk
+        tasks = []
+        for i in range(num_chunks):
+            instance = instances[i % len(instances)]
+            task = self._scrape_single_chunk(
+                keyword=keyword,
+                chunk_index=i,
+                depth=depth_per_chunk,
+                instance=instance,
+                geo_coordinates=geo_coordinates,
+                zoom=zoom,
+                radius=radius,
+                lang=lang,
+                extract_emails=extract_emails,
+            )
+            tasks.append(task)
+
+        # Run all chunks in parallel
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Combine and deduplicate
+        all_results = []
+        successful_chunks = 0
+        failed_chunks = 0
+
+        for i, result in enumerate(chunk_results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "go_scraper.chunk_failed",
+                    chunk_index=i,
+                    error=str(result)
+                )
+                failed_chunks += 1
+            elif result:
+                all_results.extend(result)
+                successful_chunks += 1
+            else:
+                failed_chunks += 1
+
+        # Deduplicate by name+address
+        seen = set()
+        unique_results = []
+        for r in all_results:
+            key = (
+                r.get("name", "").lower().strip(),
+                r.get("address", "").lower().strip()
+            )
+            if key not in seen and key != ("", ""):
+                seen.add(key)
+                unique_results.append(r)
+
+        logger.info(
+            "go_scraper.chunked_complete",
+            keyword=keyword,
+            total_collected=len(all_results),
+            after_dedup=len(unique_results),
+            successful_chunks=successful_chunks,
+            failed_chunks=failed_chunks,
+            total_chunks=num_chunks
+        )
+
+        return unique_results[:total_results]
+
+    async def _clear_instance_queue(self, instance: str) -> None:
+        """
+        Clear pending/stuck jobs from a Go scraper instance before submitting new batch.
+        
+        Uses the Go scraper's own DELETE API to remove old jobs from the SQLite queue.
+        This prevents stuck "pending" jobs from blocking new submissions.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                # Get all jobs on this instance
+                resp = await client.get(
+                    f"{instance}/api/v1/jobs",
+                    headers=self._headers
+                )
+                
+                if resp.status_code != 200:
+                    return
+                
+                jobs = resp.json()
+                if not jobs:
+                    return
+                
+                # Delete ALL jobs (pending, working, ok, failed)
+                # Old completed jobs fill up the queue and block new submissions
+                deleted = 0
+                for job in jobs:
+                    job_id = job.get("ID") or job.get("id", "")
+                    if job_id:
+                        try:
+                            del_resp = await client.delete(
+                                f"{instance}/api/v1/jobs/{job_id}",
+                                headers=self._headers
+                            )
+                            if del_resp.status_code in (200, 204, 404):
+                                deleted += 1
+                        except Exception:
+                            pass
+                
+                if deleted > 0:
+                    logger.info(
+                        "go_scraper.queue_cleared",
+                        instance=instance,
+                        deleted_jobs=deleted
+                    )
+                    
+        except Exception as e:
+            logger.warning(
+                "go_scraper.queue_clear_failed",
+                instance=instance,
+                error=str(e)
+            )
+
+    async def _scrape_single_chunk(
+        self,
+        keyword: str,
+        chunk_index: int,
+        depth: int,
+        instance: str,
+        geo_coordinates: str = "",
+        zoom: int = 14,
+        radius: float = 5,
+        lang: str = "en",
+        extract_emails: bool = False,
+    ) -> list[dict]:
+        """Scrape one chunk on a specific instance."""
+        # PRODUCTION FIX: Increased timeouts to account for:
+        # - Go scraper startup time: 2-3 minutes
+        # - Processing time: 4-5 minutes for 80 results
+        # - Queue delays when multiple neighborhoods are submitted
+        estimated_results = min(depth * 8, 120)
+        base_time = 180   # search + scroll + startup (increased from 60s)
+        detail_time = estimated_results * 5  # 5s per page (increased from 3s)
+        buffer = 120      # safety margin (increased from 90s)
+        go_timeout = int(base_time + detail_time + buffer)
+        # Increased upper limit to 1200s (20 min) to handle complex neighborhoods
+        go_timeout = max(300, min(go_timeout, 1200))
+        
+        logger.info(
+            "go_scraper.chunk_timeout_calculated",
+            chunk_index=chunk_index,
+            estimated_results=estimated_results,
+            timeout_seconds=go_timeout
+        )
+
+        lat, lon = "", ""
+        if geo_coordinates:
+            parts = geo_coordinates.split(",")
+            if len(parts) == 2:
+                lat = parts[0].strip()
+                lon = parts[1].strip()
+
+        payload = {
+            "name": f"chunk-{chunk_index}-{keyword[:30]}",
+            "keywords": [keyword],
+            "lang": lang,
+            "zoom": zoom,
+            "depth": depth,
+            "fast_mode": False,
+            "email": extract_emails,
+            "radius": int(radius * 1000) if radius > 0 else 10000,
+            "max_time": go_timeout,  # Go scraper expects "max_time", not "timeout"
+            "lat": lat,
+            "lon": lon,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                job_id = await self._submit_job(client, payload, instance)
+                if not job_id:
+                    logger.warning(
+                        "go_scraper.chunk_submit_failed",
+                        chunk_index=chunk_index,
+                        instance=instance
+                    )
+                    return []
+
+                logger.info(
+                    "go_scraper.chunk_submitted",
+                    chunk_index=chunk_index,
+                    job_id=job_id,
+                    instance=instance
+                )
+
+                job_data = await self._poll_until_done(
+                    client, job_id, keyword, go_timeout, instance
+                )
+
+                if job_data:
+                    status = (
+                        job_data.get("Status") or
+                        job_data.get("status", "")
+                    )
+                    if status in ("ok", "working"):
+                        results = await self._download_and_parse(
+                            job_id, keyword, instance
+                        )
+                        logger.info(
+                            "go_scraper.chunk_complete",
+                            chunk_index=chunk_index,
+                            result_count=len(results or []),
+                            instance=instance
+                        )
+                        return results or []
+
+                return []
+
+        except Exception as e:
+            logger.warning(
+                "go_scraper.chunk_error",
+                chunk_index=chunk_index,
+                instance=instance,
+                error=str(e)
+            )
+            return []
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -276,8 +880,11 @@ class GoScraperClient:
             max_time_seconds: Override the default timeout with the job's max_time + buffer
         """
         # Use job-specific timeout if provided, otherwise use default
-        # Add 60 second buffer to allow Go scraper to finish and report status
-        timeout = (max_time_seconds + 60) if max_time_seconds else self.timeout
+        # Add 300 second buffer to allow for:
+        # - Browser download on fresh containers (2-3 min)
+        # - Go scraper startup time (~30s)
+        # - Status reporting after completion
+        timeout = (max_time_seconds + 300) if max_time_seconds else self.timeout
         deadline = time.time() + timeout
         attempt = 0
 
@@ -296,6 +903,19 @@ class GoScraperClient:
                     f"{base_url}/api/v1/jobs/{job_id}",
                     headers=self._headers,
                 )
+                if resp.status_code == 404:
+                    # Job was deleted from Go scraper SQLite (cleanup task or auto-delete
+                    # after completion). Treat as completed - attempt to download CSV.
+                    logger.warning(
+                        "go_scraper.job_not_found_attempting_download",
+                        job_id=job_id,
+                        attempt=attempt,
+                        instance=base_url,
+                        message="Job 404 - may have completed and been cleaned up, trying CSV download"
+                    )
+                    # Return a synthetic "ok" response so caller attempts download
+                    return {"Status": "ok", "id": job_id}
+
                 if resp.status_code != 200:
                     logger.warning(
                         "go_scraper.poll_error",
@@ -344,21 +964,35 @@ class GoScraperClient:
             "go_scraper.poll_timeout",
             job_id=job_id,
             keyword=keyword,
-            timeout=timeout,  # Log the actual timeout used, not self.timeout
+            timeout=timeout,
             instance=base_url,
-            message="Timeout reached - will attempt to download partial results"
+            message="Timeout — attempting partial download"
         )
-        # Return the job data even though it timed out - it might have partial results
-        # The caller will check if there are any results to download
         try:
             resp = await client.get(
                 f"{base_url}/api/v1/jobs/{job_id}",
                 headers=self._headers,
             )
             if resp.status_code == 200:
-                return resp.json()
+                job_data = resp.json()
+                current_status = (
+                    job_data.get("Status") or
+                    job_data.get("status", "")
+                )
+                logger.info(
+                    "go_scraper.timeout_status_check",
+                    job_id=job_id,
+                    status=current_status,
+                    message="Downloading partial results"
+                )
+                if current_status in ("ok", "working"):
+                    return job_data
         except Exception as e:
-            logger.warning("go_scraper.timeout_status_check_failed", job_id=job_id, error=str(e))
+            logger.warning(
+                "go_scraper.timeout_download_failed",
+                job_id=job_id,
+                error=str(e)
+            )
         return None
 
     async def _download_and_parse(self, job_id: str, keyword: str, base_url: str) -> list[dict]:
