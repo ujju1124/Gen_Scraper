@@ -193,7 +193,21 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		return err
 	}
 
-	defer mate.Close()
+	// Close mate in a goroutine with a timeout to avoid blocking the work loop.
+	// mate.Close() can hang indefinitely if Chrome doesn't exit cleanly.
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			mate.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// closed cleanly
+		case <-time.After(15 * time.Second):
+			log.Printf("warning: mate.Close() timed out for job %s, continuing", job.ID)
+		}
+	}()
 
 	var coords string
 	if job.Data.Lat != "" && job.Data.Lon != "" {
