@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, ARRAY
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, ARRAY, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func, text
 from database import Base
@@ -33,3 +33,6 @@ class ScrapeJob(Base):
     # Scraping progress — updated during job execution for live progress display
     # e.g. "🔍 Searching Google Maps...", "✅ Google Maps complete - 30 hotels found"
     scraping_progress = Column(String, nullable=True)
+
+    # Phase 1 — skip existing records option
+    skip_existing = Column(Boolean, nullable=True, default=False)

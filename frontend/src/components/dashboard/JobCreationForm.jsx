@@ -26,6 +26,7 @@ export function JobCreationForm() {
   const [resultLimit, setResultLimit] = useState(null)       // null = max
   const [customLimit, setCustomLimit] = useState('')          // free-text custom value
   const [useCustom, setUseCustom] = useState(false)          // toggle custom input
+  const [skipExisting, setSkipExisting] = useState(false)    // Phase 1: skip existing records
   
   // Google Maps settings state
   const [showGoogleMapsSettings, setShowGoogleMapsSettings] = useState(false)
@@ -150,6 +151,7 @@ export function JobCreationForm() {
         location: location.trim(),
         source_ids: selectedSources,
         max_results: effectiveLimit,  // null = scrape all
+        skip_existing: skipExisting,   // Phase 1: skip existing records
       }
       
       // Add Google Maps settings if any non-default values are set
@@ -289,6 +291,28 @@ export function JobCreationForm() {
           {effectiveLimit === null
             ? '✦ Max — scrape all available listings across all pages.'
             : `Stop after ${effectiveLimit.toLocaleString()} results per source. If fewer exist, all are returned.`}
+        </p>
+      </div>
+
+      {/* Skip Existing Checkbox */}
+      <div>
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={skipExisting}
+            onChange={(e) => setSkipExisting(e.target.checked)}
+            className="rounded border-slate-300 text-primary-600 focus:ring-primary-500"
+            disabled={loading}
+          />
+          <span className="text-sm text-slate-700">
+            Skip businesses already in database
+            <span className="text-slate-500 ml-1.5 text-xs">
+              (saves time on re-scraping same areas)
+            </span>
+          </span>
+        </label>
+        <p className="mt-1.5 text-xs text-slate-500 ml-6">
+          When enabled, duplicate records are skipped <strong>before</strong> scraping, reducing processing time and network usage.
         </p>
       </div>
 

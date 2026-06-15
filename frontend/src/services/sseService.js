@@ -13,10 +13,13 @@
 export const createJobStatusStream = (jobId, onMessage, onError) => {
   // Use relative URL to go through Vite proxy
   const url = `/api/v1/jobs/${jobId}/stream`
+  console.log('Creating SSE connection to:', url)
+  
   const eventSource = new EventSource(url, { withCredentials: true })
 
   eventSource.addEventListener('status', (event) => {
     try {
+      console.log('SSE status event received:', event.data)
       const data = JSON.parse(event.data)
       onMessage(data)
     } catch (error) {
@@ -24,8 +27,13 @@ export const createJobStatusStream = (jobId, onMessage, onError) => {
     }
   })
 
+  eventSource.addEventListener('open', () => {
+    console.log('SSE connection opened successfully')
+  })
+
   eventSource.onerror = (error) => {
     console.error('SSE connection error:', error)
+    console.log('EventSource readyState:', eventSource.readyState)
     onError(error)
     eventSource.close()
   }

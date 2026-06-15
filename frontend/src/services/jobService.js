@@ -64,12 +64,23 @@ export const getJobStatus = async (jobId) => {
  * @param {string} jobId - Job ID
  * @param {number} page - Page number (default 1)
  * @param {number} pageSize - Page size (default 50)
+ * @param {string} filterType - Filter type: 'all', 'new', 'updated', 'duplicates' (default 'all')
  * @returns {Promise<Object>} Paginated results response
  */
-export const getJobResults = async (jobId, page = 1, pageSize = 50) => {
+export const getJobResults = async (jobId, page = 1, pageSize = 50, filterType = 'all') => {
   const response = await api.get(`/api/v1/jobs/${jobId}/results`, {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, filter_type: filterType }
   })
+  return response.data
+}
+
+/**
+ * Cancel a running job
+ * @param {string} jobId - Job ID to cancel
+ * @returns {Promise<Object>} Cancel response
+ */
+export const cancelJob = async (jobId) => {
+  const response = await api.post(`/api/v1/jobs/${jobId}/cancel`)
   return response.data
 }
 
@@ -90,5 +101,16 @@ export const retryJob = async (jobId) => {
  */
 export const getResultDetail = async (resultId) => {
   const response = await api.get(`/api/v1/jobs/results/${resultId}`)
+  return response.data
+}
+
+
+/**
+ * Get duplicate history for a result
+ * @param {string} resultId - Result ID
+ * @returns {Promise<Object>} Duplicate history data
+ */
+export const getDuplicateHistory = async (resultId) => {
+  const response = await api.get(`/api/v1/jobs/results/${resultId}/duplicate-history`)
   return response.data
 }

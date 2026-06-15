@@ -6,6 +6,7 @@ import asyncio
 import json
 from typing import List, Optional
 from uuid import UUID
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -41,6 +42,7 @@ class CreateJobRequest(BaseModel):
     source_ids: Optional[List[int]] = None
     max_results: Optional[int] = None  # None = scrape all; integer = cap per source
     google_maps_settings: Optional[GoogleMapsSettings] = None  # Settings for Google Maps scraper
+    skip_existing: Optional[bool] = False  # Skip records that already exist in database
 
 
 class JobResponse(BaseModel):
@@ -92,6 +94,9 @@ class CleanedResultResponse(BaseModel):
     merged_from_sources: Optional[List[int]] = None
     confidence_score: Optional[float] = None
     merged_at: Optional[str] = None
+    # Duplicate tracking fields
+    is_new_record: Optional[bool] = True  # Default to True for backwards compatibility
+    is_updated_record: Optional[bool] = False  # Default to False
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -138,6 +143,7 @@ async def create_job(
         source_ids=job_request.source_ids,
         max_results=job_request.max_results,
         google_maps_settings=job_request.google_maps_settings.model_dump() if job_request.google_maps_settings else None,
+        skip_existing=job_request.skip_existing or False,
         status="QUEUED"
     )
     
@@ -306,6 +312,10 @@ async def stream_job_status(
         )
     
     async def event_generator():
+        # Create a new database session for the SSE stream (don't use injected db)
+        from database import SessionLocal
+        stream_db = SessionLocal()
+        
         try:
             # Send initial connection event
             yield ": connected\n\n"
@@ -316,8 +326,8 @@ async def stream_job_status(
                     logger.info("sse.client_disconnected", job_id=str(job_id))
                     break
                 
-                # Re-query job from database instead of refresh to avoid session detachment issues
-                current_job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+                # Re-query job from database with dedicated session
+                current_job = stream_db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
                 
                 if not current_job:
                     logger.error("sse.job_not_found", job_id=str(job_id))
@@ -331,16 +341,16 @@ async def stream_job_status(
                     "scraping_progress": current_job.scraping_progress,  # Add live progress
                 }
                 
+                # Add statistics if available (for both RUNNING and DONE status)
+                if current_job.statistics:
+                    event_data["statistics"] = current_job.statistics
+                
                 # Add result count if done
                 if current_job.status == "DONE":
-                    result_count = db.query(func.count(CleanedResult.id)).filter(
+                    result_count = stream_db.query(func.count(CleanedResult.id)).filter(
                         CleanedResult.job_id == job_id
                     ).scalar()
                     event_data["result_count"] = result_count
-                    
-                    # Add statistics if available
-                    if current_job.statistics:
-                        event_data["statistics"] = current_job.statistics
                 
                 # Add error message if failed
                 if current_job.status == "FAILED":
@@ -369,6 +379,9 @@ async def stream_job_status(
             # Send error event
             yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
             return
+        finally:
+            # Always close the dedicated database session
+            stream_db.close()
     
     return StreamingResponse(
         event_generator(),
@@ -387,15 +400,17 @@ def get_job_results(
     job_id: UUID,
     page: int = 1,
     page_size: int = 50,
+    filter_type: str = "all",  # all, new, updated, duplicates
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Get paginated cleaned results for a job.
+    Get paginated cleaned results for a job with optional filtering.
     
     - Default page_size=50, max page_size=200
     - Ordered by created_at DESC
     - Returns 404 if job not found or doesn't belong to user
+    - filter_type: all, new, updated, duplicates
     """
     # Verify job exists and belongs to user
     job = db.query(ScrapeJob).filter(
@@ -419,6 +434,18 @@ def get_job_results(
     
     # Query results for this job
     query = db.query(CleanedResult).filter(CleanedResult.job_id == job_id)
+    
+    # Apply filters based on filter_type
+    if filter_type == "new":
+        query = query.filter(CleanedResult.is_new_record == True)
+    elif filter_type == "updated":
+        query = query.filter(CleanedResult.is_updated_record == True)
+    elif filter_type == "duplicates":
+        query = query.filter(
+            CleanedResult.is_new_record == False,
+            CleanedResult.is_updated_record == False
+        )
+    # else: filter_type == "all" - no additional filter
     
     # Get total count
     total = query.count()
@@ -447,7 +474,9 @@ def get_job_results(
             "latitude": float(result.latitude) if result.latitude else None,
             "longitude": float(result.longitude) if result.longitude else None,
             "phone_primary": result.phone_primary,
-            "created_at": result.created_at.isoformat() if result.created_at else None
+            "created_at": result.created_at.isoformat() if result.created_at else None,
+            "is_new_record": result.is_new_record,
+            "is_updated_record": result.is_updated_record
         })
     
     return {
@@ -456,6 +485,61 @@ def get_job_results(
         "page": page,
         "page_size": page_size,
         "pages": pages
+    }
+
+
+@router.post("/{job_id}/cancel")
+async def cancel_job(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Cancel a running scrape job.
+    
+    - Verifies job exists and belongs to user
+    - Only works for QUEUED or RUNNING jobs
+    - Revokes Celery task with SIGTERM signal
+    - Updates job status to CANCELLED
+    - Partial results collected so far are saved
+    """
+    # Fetch job
+    job = db.query(ScrapeJob).filter(
+        ScrapeJob.id == job_id,
+        ScrapeJob.user_id == current_user.id
+    ).first()
+    
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found"
+        )
+    
+    # Check if job can be cancelled
+    if job.status not in ["QUEUED", "RUNNING"]:
+        return {
+            "success": False,
+            "message": f"Job cannot be cancelled. Current status: {job.status}",
+            "status": job.status
+        }
+    
+    # Revoke Celery task
+    if job.celery_task_id:
+        from celery.result import AsyncResult
+        AsyncResult(job.celery_task_id).revoke(terminate=True, signal='SIGTERM')
+        logger.info("job.cancelled", job_id=str(job_id), celery_task_id=job.celery_task_id)
+    
+    # Update job status
+    job.status = "CANCELLED"
+    job.completed_at = datetime.utcnow()
+    job.error_message = "Cancelled by user"
+    db.commit()
+    
+    return {
+        "success": True,
+        "job_id": str(job_id),
+        "status": "CANCELLED",
+        "message": "Job cancelled successfully. Partial results have been saved."
     }
 
 
@@ -681,3 +765,90 @@ async def get_go_scraper_queue_status(
     pool_status = await go_scraper_pool.get_all_queue_status()
     
     return pool_status
+
+
+@router.get("/results/{result_id}/duplicate-history")
+def get_duplicate_history(
+    result_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get the original job that first scraped this duplicate record.
+    
+    Returns:
+    - is_duplicate: Boolean indicating if this is a duplicate
+    - original_job_id: UUID of the first job that scraped this record
+    - original_job_date: When the original job was completed
+    - original_job_location: Location of the original job
+    - dedup_key: The dedup_key used to identify duplicates
+    
+    Returns 404 if result not found.
+    Returns 403 if result doesn't belong to user's job.
+    """
+    # Load the current result
+    current_result = db.query(CleanedResult).filter(
+        CleanedResult.id == result_id
+    ).first()
+    
+    if not current_result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Result not found"
+        )
+    
+    # Verify ownership (result belongs to job belonging to user)
+    job = db.query(ScrapeJob).filter(
+        ScrapeJob.id == current_result.job_id,
+        ScrapeJob.user_id == current_user.id
+    ).first()
+    
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+    
+    # If not a duplicate, return early
+    if current_result.is_new_record or current_result.is_updated_record:
+        return {
+            "is_duplicate": False,
+            "original_job_id": None,
+            "original_job_date": None,
+            "original_job_location": None,
+            "dedup_key": current_result.dedup_key
+        }
+    
+    # Find the original record (first record with same dedup_key)
+    original_result = db.query(CleanedResult).join(
+        ScrapeJob, CleanedResult.job_id == ScrapeJob.id
+    ).filter(
+        CleanedResult.dedup_key == current_result.dedup_key,
+        ScrapeJob.user_id == current_user.id,  # Same user's jobs
+        CleanedResult.created_at < current_result.created_at  # Earlier record
+    ).order_by(
+        CleanedResult.created_at.asc()  # Get the earliest
+    ).first()
+    
+    if not original_result:
+        # Shouldn't happen, but handle gracefully
+        return {
+            "is_duplicate": True,
+            "original_job_id": None,
+            "original_job_date": None,
+            "original_job_location": "Unknown",
+            "dedup_key": current_result.dedup_key
+        }
+    
+    # Load original job details
+    original_job = db.query(ScrapeJob).filter(
+        ScrapeJob.id == original_result.job_id
+    ).first()
+    
+    return {
+        "is_duplicate": True,
+        "original_job_id": str(original_job.id),
+        "original_job_date": original_job.completed_at.isoformat() if original_job.completed_at else None,
+        "original_job_location": original_job.location,
+        "dedup_key": current_result.dedup_key
+    }

@@ -20,7 +20,36 @@ export function JobResultsPage() {
   const [totalPages, setTotalPages] = useState(1)
   const [totalCount, setTotalCount] = useState(0)
   const [activeTab, setActiveTab] = useState('table') // 'table' or 'map'
+  const [filterType, setFilterType] = useState('all') // 'all', 'new', 'updated', 'duplicates'
+  const [filterStats, setFilterStats] = useState({ all: 0, new: 0, updated: 0, duplicates: 0 })
+  const [duplicateDetailModal, setDuplicateDetailModal] = useState(null)
+  const [loadingDuplicateDetail, setLoadingDuplicateDetail] = useState(false)
   const pageSize = 50
+
+  // Fetch all filter stats on initial load
+  useEffect(() => {
+    const fetchFilterStats = async () => {
+      try {
+        const [allData, newData, updatedData, duplicatesData] = await Promise.all([
+          jobService.getJobResults(id, 1, 1, 'all'),
+          jobService.getJobResults(id, 1, 1, 'new'),
+          jobService.getJobResults(id, 1, 1, 'updated'),
+          jobService.getJobResults(id, 1, 1, 'duplicates')
+        ])
+        
+        setFilterStats({
+          all: allData.total || 0,
+          new: newData.total || 0,
+          updated: updatedData.total || 0,
+          duplicates: duplicatesData.total || 0
+        })
+      } catch (err) {
+        console.error('Error fetching filter stats:', err)
+      }
+    }
+
+    fetchFilterStats()
+  }, [id])
 
   // Fetch job details first to get location
   useEffect(() => {
@@ -42,10 +71,16 @@ export function JobResultsPage() {
       setError('')
 
       try {
-        const data = await jobService.getJobResults(id, page, pageSize)
+        const data = await jobService.getJobResults(id, page, pageSize, filterType)
         setResults(data.items || [])
         setTotalPages(data.pages || 1)
         setTotalCount(data.total || 0)
+        
+        // Update filter stats
+        setFilterStats(prev => ({
+          ...prev,
+          [filterType]: data.total || 0
+        }))
       } catch (err) {
         setError('Failed to load results')
         console.error('Error fetching results:', err)
@@ -55,7 +90,7 @@ export function JobResultsPage() {
     }
 
     fetchResults()
-  }, [id, page])
+  }, [id, page, filterType])
 
   const formatRating = (rating) => {
     if (!rating) return 'N/A'
@@ -66,6 +101,24 @@ export function JobResultsPage() {
     if (!price) return 'N/A'
     // Assuming NPR currency
     return `NPR ${parseFloat(price).toLocaleString()}`
+  }
+
+  const handleShowDuplicateDetail = async (resultId) => {
+    setLoadingDuplicateDetail(true)
+    try {
+      const history = await jobService.getDuplicateHistory(resultId)
+      setDuplicateDetailModal(history)
+    } catch (err) {
+      console.error('Failed to load duplicate history:', err)
+      // Show error toast
+      const toast = document.createElement('div')
+      toast.className = 'fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg text-white z-50 bg-red-600'
+      toast.textContent = 'Failed to load duplicate history'
+      document.body.appendChild(toast)
+      setTimeout(() => toast.remove(), 3000)
+    } finally {
+      setLoadingDuplicateDetail(false)
+    }
   }
 
   if (loading) {
@@ -126,6 +179,50 @@ export function JobResultsPage() {
 
       {/* Results Table */}
       <div className="card p-6">
+        {/* Filter Buttons */}
+        <div className="mb-6 flex flex-wrap gap-2">
+          <button
+            onClick={() => { setFilterType('all'); setPage(1); }}
+            className={`px-4 py-2 rounded-lg border-2 text-sm font-medium transition-colors ${
+              filterType === 'all'
+                ? 'bg-slate-600 text-white border-slate-600'
+                : 'bg-white text-slate-600 border-slate-300 hover:border-slate-400'
+            }`}
+          >
+            All ({filterStats.all})
+          </button>
+          <button
+            onClick={() => { setFilterType('new'); setPage(1); }}
+            className={`px-4 py-2 rounded-lg border-2 text-sm font-medium transition-colors ${
+              filterType === 'new'
+                ? 'bg-green-600 text-white border-green-600'
+                : 'bg-white text-green-600 border-green-300 hover:border-green-400'
+            }`}
+          >
+            New ({filterStats.new})
+          </button>
+          <button
+            onClick={() => { setFilterType('updated'); setPage(1); }}
+            className={`px-4 py-2 rounded-lg border-2 text-sm font-medium transition-colors ${
+              filterType === 'updated'
+                ? 'bg-orange-600 text-white border-orange-600'
+                : 'bg-white text-orange-600 border-orange-300 hover:border-orange-400'
+            }`}
+          >
+            Updated ({filterStats.updated})
+          </button>
+          <button
+            onClick={() => { setFilterType('duplicates'); setPage(1); }}
+            className={`px-4 py-2 rounded-lg border-2 text-sm font-medium transition-colors ${
+              filterType === 'duplicates'
+                ? 'bg-red-600 text-white border-red-600'
+                : 'bg-white text-red-600 border-red-300 hover:border-red-400'
+            }`}
+          >
+            Duplicates ({filterStats.duplicates})
+          </button>
+        </div>
+
         {/* Tab Navigation */}
         <div className="border-b border-slate-200 mb-6">
           <nav className="-mb-px flex space-x-8">
@@ -240,7 +337,37 @@ export function JobResultsPage() {
                       {results.map((result) => (
                         <tr key={result.id} className="hover:bg-slate-50">
                           <td className="px-4 py-3 text-sm font-medium text-slate-900">
-                            {result.name || 'N/A'}
+                            <div className="flex items-center gap-2">
+                              <span>{result.name || 'N/A'}</span>
+                              {result.is_new_record === false && result.is_updated_record === false && (
+                                <button
+                                  onClick={() => handleShowDuplicateDetail(result.id)}
+                                  className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 hover:bg-red-200 transition-colors cursor-pointer"
+                                  title="Click to see original job that scraped this record"
+                                >
+                                  🔁 Duplicate
+                                  <svg className="ml-1 w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                  </svg>
+                                </button>
+                              )}
+                              {result.is_new_record === true && (
+                                <span 
+                                  className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800"
+                                  title="This is a new record - first time scraped"
+                                >
+                                  ✨ New
+                                </span>
+                              )}
+                              {result.is_updated_record === true && (
+                                <span 
+                                  className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-800"
+                                  title="This record was updated with new data"
+                                >
+                                  📝 Updated
+                                </span>
+                              )}
+                            </div>
                           </td>
                           <td className="px-4 py-3 text-sm text-slate-700">
                             {result.city || 'N/A'}
@@ -304,6 +431,85 @@ export function JobResultsPage() {
           </div>
         )}
       </div>
+
+      {/* Duplicate Detail Modal */}
+      {duplicateDetailModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-bold text-slate-900">
+                🔁 Duplicate Record Details
+              </h3>
+              <button
+                onClick={() => setDuplicateDetailModal(null)}
+                className="text-slate-400 hover:text-slate-600"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            {duplicateDetailModal.is_duplicate ? (
+              <div className="space-y-4">
+                <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                  <p className="text-sm text-yellow-800 mb-2">
+                    ⚠️ This record was already scraped in a previous job.
+                  </p>
+                  <p className="text-xs text-yellow-700">
+                    It appears in this job's results for visibility, but was not saved as a new record.
+                  </p>
+                </div>
+                
+                <div>
+                  <label className="text-xs font-medium text-slate-600">Original Job ID</label>
+                  <p className="text-sm font-mono text-slate-900 mt-1">
+                    #{duplicateDetailModal.original_job_id?.substring(0, 8)}...
+                  </p>
+                </div>
+                
+                <div>
+                  <label className="text-xs font-medium text-slate-600">Original Scrape Date</label>
+                  <p className="text-sm text-slate-900 mt-1">
+                    {duplicateDetailModal.original_job_date 
+                      ? new Date(duplicateDetailModal.original_job_date).toLocaleString()
+                      : 'Unknown'}
+                  </p>
+                </div>
+                
+                <div>
+                  <label className="text-xs font-medium text-slate-600">Original Job Location</label>
+                  <p className="text-sm text-slate-900 mt-1">
+                    {duplicateDetailModal.original_job_location || 'Unknown'}
+                  </p>
+                </div>
+                
+                <div className="flex gap-3 pt-3 border-t border-slate-200">
+                  <Link
+                    to={`/jobs/${duplicateDetailModal.original_job_id}`}
+                    className="flex-1 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 text-sm font-medium text-center"
+                    onClick={() => setDuplicateDetailModal(null)}
+                  >
+                    View Original Job
+                  </Link>
+                  <button
+                    onClick={() => setDuplicateDetailModal(null)}
+                    className="px-4 py-2 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50 text-sm font-medium"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
+                <p className="text-sm text-green-800">
+                  ✅ This is not a duplicate. This record was first scraped in this job.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -8,16 +8,148 @@ import * as jobService from '../services/jobService'
 import * as sseService from '../services/sseService'
 import { StatusBadge } from '../components/StatusBadge'
 
+// Cancel Button Component with double confirmation
+function CancelButton({ jobId, onCancel }) {
+  const [showFirstModal, setShowFirstModal] = useState(false)
+  const [showSecondModal, setShowSecondModal] = useState(false)
+  const [isCancelling, setIsCancelling] = useState(false)
+
+  const handleFirstConfirm = () => {
+    setShowFirstModal(false)
+    setShowSecondModal(true)
+  }
+
+  const handleFinalCancel = async () => {
+    setIsCancelling(true)
+    try {
+      await jobService.cancelJob(jobId)
+      
+      // Show success toast
+      const toast = document.createElement('div')
+      toast.className = 'fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg text-white z-50 bg-green-600'
+      toast.textContent = 'Job cancelled successfully. Partial results have been saved.'
+      document.body.appendChild(toast)
+
+      setTimeout(() => {
+        toast.remove()
+        setShowSecondModal(false)
+        onCancel() // Refresh job status
+      }, 2000)
+    } catch (err) {
+      setIsCancelling(false)
+      
+      // Show error toast
+      const toast = document.createElement('div')
+      toast.className = 'fixed top-4 right-4 px-6 py-3 rounded-lg shadow-lg text-white z-50 bg-red-600'
+      toast.textContent = err.response?.data?.detail || 'Failed to cancel job'
+      document.body.appendChild(toast)
+
+      setTimeout(() => {
+        toast.remove()
+      }, 3000)
+    }
+  }
+
+  return (
+    <>
+      <button
+        onClick={() => setShowFirstModal(true)}
+        className="btn bg-red-600 hover:bg-red-700 text-white flex items-center gap-2"
+        aria-label="Cancel job"
+      >
+        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+        </svg>
+        Cancel Job
+      </button>
+
+      {/* First Confirmation Modal */}
+      {showFirstModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+            <h3 className="text-lg font-bold text-slate-900 mb-4">⚠️ Cancel Scraping Job?</h3>
+            <p className="text-slate-700 mb-4">
+              Are you sure you want to cancel this job?
+            </p>
+            <p className="text-sm text-slate-600 mb-6">
+              Progress will be lost but results collected so far will be saved.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setShowFirstModal(false)}
+                className="px-4 py-2 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50"
+              >
+                No, Continue Job
+              </button>
+              <button
+                onClick={handleFirstConfirm}
+                className="px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700"
+              >
+                Yes, Cancel Job
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Second Confirmation Modal */}
+      {showSecondModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4">
+            <h3 className="text-lg font-bold text-red-600 mb-4">🛑 Final Confirmation</h3>
+            <p className="text-slate-900 font-semibold mb-2">
+              This action cannot be undone!
+            </p>
+            <p className="text-slate-700 mb-6">
+              The job will be marked as CANCELLED and the scraping process will stop immediately.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setShowSecondModal(false)}
+                disabled={isCancelling}
+                className="px-4 py-2 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Go Back
+              </button>
+              <button
+                onClick={handleFinalCancel}
+                disabled={isCancelling}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-semibold disabled:opacity-50 flex items-center gap-2"
+              >
+                {isCancelling ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Cancelling...
+                  </>
+                ) : (
+                  'Confirm Cancellation'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
 export function JobStatusPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [jobStatus, setJobStatus] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [usePolling, setUsePolling] = useState(false)
+  const [usePolling, setUsePolling] = useState(true)  // Start with polling enabled
   const [isRetrying, setIsRetrying] = useState(false)
   const eventSourceRef = useRef(null)
   const pollingIntervalRef = useRef(null)
+  const sseInitializedRef = useRef(false)  // Track if SSE was already set up
+  
+  // Extract status for stable dependency
+  const currentStatus = jobStatus?.status
 
   // Fetch initial job status
   useEffect(() => {
@@ -38,12 +170,15 @@ export function JobStatusPage() {
 
   // Set up SSE connection with polling fallback
   useEffect(() => {
-    if (loading || !jobStatus) return
-
-    // Don't monitor if job is already done or failed
-    if (jobStatus.status === 'DONE' || jobStatus.status === 'FAILED') {
-      return
-    }
+    // Only set up SSE if we have job data and job is running/queued
+    if (!jobStatus) return
+    if (jobStatus.status === 'DONE' || jobStatus.status === 'FAILED') return
+    
+    // Don't create SSE if polling is already active
+    if (usePolling) return
+    
+    // Don't create duplicate SSE connections
+    if (eventSourceRef.current) return
 
     // Try SSE first
     const handleSSEMessage = (data) => {
@@ -71,9 +206,10 @@ export function JobStatusPage() {
     return () => {
       if (eventSourceRef.current) {
         sseService.closeStream(eventSourceRef.current)
+        eventSourceRef.current = null
       }
     }
-  }, [id, loading])  // Don't depend on jobStatus to avoid SSE reconnection loops
+  }, [id, currentStatus, usePolling])  // Use extracted status value for stable dependency
 
   // Polling fallback
   useEffect(() => {
@@ -81,6 +217,11 @@ export function JobStatusPage() {
 
     // Don't poll if job is done or failed
     if (jobStatus.status === 'DONE' || jobStatus.status === 'FAILED') {
+      // Clear any existing interval
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current)
+        pollingIntervalRef.current = null
+      }
       return
     }
 
@@ -93,15 +234,21 @@ export function JobStatusPage() {
       }
     }
 
-    // Poll every 5 seconds
-    pollingIntervalRef.current = setInterval(pollStatus, 5000)
+    // Clear any existing interval before creating new one
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current)
+    }
+
+    // Poll every 2 seconds for faster phase updates
+    pollingIntervalRef.current = setInterval(pollStatus, 2000)
 
     return () => {
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current)
+        pollingIntervalRef.current = null
       }
     }
-  }, [id, usePolling])  // Don't depend on jobStatus to avoid polling restart loops
+  }, [id, usePolling, currentStatus])  // Use extracted status value for stable dependency
 
   const formatDate = (dateString) => {
     if (!dateString) return 'N/A'
@@ -264,9 +411,16 @@ export function JobStatusPage() {
                 <p className="text-xs text-orange-700 font-medium">Duplicates</p>
                 <p className="text-2xl font-bold text-orange-600">{jobStatus.statistics.duplicates || 0}</p>
               </div>
-              <div>
-                <p className="text-xs text-purple-700 font-medium">Updated</p>
+              <div className="relative group">
+                <p className="text-xs text-purple-700 font-medium flex items-center gap-1">
+                  Enhanced
+                  <span className="inline-block cursor-help">ℹ️</span>
+                </p>
                 <p className="text-2xl font-bold text-purple-600">{jobStatus.statistics.updated_records || 0}</p>
+                {/* Tooltip */}
+                <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block w-64 p-2 bg-slate-800 text-white text-xs rounded shadow-lg z-10">
+                  Existing records from previous jobs that were improved with better data (e.g., added coordinates, reviews, or contact info)
+                </div>
               </div>
             </div>
             
@@ -297,20 +451,63 @@ export function JobStatusPage() {
         {/* Progress Indicator for RUNNING status */}
         {jobStatus.status === 'RUNNING' && (
           <div className="mt-6">
-            <div className="flex items-center gap-3 mb-2">
-              <div className="animate-spin h-4 w-4 border-2 border-primary-600 border-t-transparent rounded-full"/>
-              <span className="text-sm font-medium text-slate-700">
-                {jobStatus.scraping_progress || 
-                 jobStatus.statistics?.progress_message || 
-                 'Scraping in progress...'}
-              </span>
-            </div>
-            <div className="w-full bg-slate-200 rounded-full h-2.5 mb-2">
-              <div className="bg-primary-600 h-2.5 rounded-full animate-pulse" style={{ width: '75%' }}/>
-            </div>
-            <p className="text-xs text-slate-500">
-              Extracting data from {jobStatus.location || 'target location'}
-            </p>
+            {/* Live Progress Panel */}
+            {jobStatus.statistics && (
+              <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg mb-4">
+                <h3 className="text-sm font-semibold text-blue-900 mb-3">🔄 Live Progress</h3>
+                
+                {/* Progress Bar with Percentage */}
+                <div className="mb-4">
+                  <div className="flex justify-between text-xs text-blue-700 mb-1">
+                    <span>Progress</span>
+                    <span className="font-semibold">{jobStatus.statistics.progress_percentage || 0}%</span>
+                  </div>
+                  <div className="w-full bg-blue-200 rounded-full h-3 overflow-hidden">
+                    <div 
+                      className="bg-blue-600 h-3 rounded-full transition-all duration-500 flex items-center justify-end pr-2"
+                      style={{ width: `${jobStatus.statistics.progress_percentage || 0}%` }}
+                    >
+                      {jobStatus.statistics.progress_percentage >= 15 && (
+                        <span className="text-xs font-bold text-white">
+                          {jobStatus.statistics.progress_percentage}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                
+                {/* Current Phase Message */}
+                <div className="p-4 bg-white rounded-lg border border-blue-300">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="animate-pulse h-3 w-3 bg-blue-500 rounded-full" />
+                      <p className="text-base font-medium text-blue-900">
+                        {jobStatus.statistics.progress_message || jobStatus.scraping_progress || 'Processing...'}
+                      </p>
+                    </div>
+                    <span className="text-xs text-blue-600 font-medium">Live</span>
+                  </div>
+                </div>
+              </div>
+            )}
+            
+            {/* Fallback Progress (if statistics not available) */}
+            {!jobStatus.statistics && (
+              <div>
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="animate-spin h-4 w-4 border-2 border-primary-600 border-t-transparent rounded-full"/>
+                  <span className="text-sm font-medium text-slate-700">
+                    {jobStatus.scraping_progress || 'Scraping in progress...'}
+                  </span>
+                </div>
+                <div className="w-full bg-slate-200 rounded-full h-2.5 mb-2">
+                  <div className="bg-primary-600 h-2.5 rounded-full animate-pulse" style={{ width: '75%' }}/>
+                </div>
+                <p className="text-xs text-slate-500">
+                  Extracting data from {jobStatus.location || 'target location'}
+                </p>
+              </div>
+            )}
           </div>
         )}
 
@@ -334,7 +531,8 @@ export function JobStatusPage() {
               <div className="bg-green-500 h-2.5 rounded-full transition-all duration-500" style={{ width: '100%' }}/>
             </div>
             <p className="text-sm text-green-600 font-medium">
-              ✅ Complete — {jobStatus.result_count || 0} results collected
+              ✅ Complete — {jobStatus.statistics?.new_records || 0} new records added
+              {jobStatus.statistics?.updated_records > 0 && `, ${jobStatus.statistics.updated_records} existing records enhanced`}
             </p>
           </div>
         )}
@@ -368,6 +566,13 @@ export function JobStatusPage() {
           </div>
         )}
 
+        {/* Cancel Button */}
+        {(jobStatus.status === 'QUEUED' || jobStatus.status === 'RUNNING') && (
+          <div className="mt-6">
+            <CancelButton jobId={id} onCancel={() => loadJob()} />
+          </div>
+        )}
+
         {/* View Results Button */}
         {jobStatus.status === 'DONE' && (
           <div className="mt-6">
@@ -375,7 +580,7 @@ export function JobStatusPage() {
               onClick={() => navigate(`/jobs/${id}/results`)}
               className="btn btn-primary"
             >
-              View Results ({jobStatus.result_count || 0})
+              View Results ({jobStatus.statistics?.new_records || 0} new)
             </button>
           </div>
         )}

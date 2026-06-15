@@ -24,6 +24,44 @@ from services.email_service import send_job_completion_email
 # Configure structlog
 logger = structlog.get_logger()
 
+
+def format_eta(elapsed_seconds: float, current_percentage: int, total_percentage: int = 100) -> str:
+    """
+    Calculate and format estimated time remaining.
+    
+    Args:
+        elapsed_seconds: Time elapsed so far
+        current_percentage: Current progress percentage (0-100)
+        total_percentage: Total progress when complete (default 100)
+    
+    Returns:
+        Formatted ETA string like "2m 30s" or "45s" or "Calculating..."
+    """
+    if current_percentage <= 0:
+        return "Calculating..."
+    
+    # Calculate average time per percentage point
+    time_per_percent = elapsed_seconds / current_percentage
+    
+    # Calculate remaining percentage
+    remaining_percent = total_percentage - current_percentage
+    
+    # Calculate ETA in seconds
+    eta_seconds = time_per_percent * remaining_percent
+    
+    # Format as human-readable string
+    if eta_seconds < 60:
+        return f"{int(eta_seconds)}s"
+    elif eta_seconds < 3600:
+        minutes = int(eta_seconds / 60)
+        seconds = int(eta_seconds % 60)
+        return f"{minutes}m {seconds}s"
+    else:
+        hours = int(eta_seconds / 3600)
+        minutes = int((eta_seconds % 3600) / 60)
+        return f"{hours}h {minutes}m"
+
+
 # Create Celery app
 celery_app = Celery(
     "scraper",
@@ -205,6 +243,151 @@ def mock_scrape_task_impl(job_id: str):
         db.close()
 
 
+async def track_go_scraper_progress(job_id: str, db: Session, max_results: int, start_time: float):
+    """
+    Poll Go scraper API for real-time progress during scraping phase.
+    
+    Queries all Go scraper instances to get current job status and counts results
+    by downloading CSV files to determine actual scraped count.
+    
+    Args:
+        job_id: Job UUID string
+        db: Database session (NOTE: We create a fresh session inside for thread safety)
+        max_results: Maximum results requested (for calculating percentage)
+        start_time: Job start timestamp (for calculating ETA)
+    """
+    import csv
+    import io
+    
+    job_uuid = uuid.UUID(job_id)
+    
+    # Go scraper instances
+    instances = [
+        "http://go_scraper_1:8080",
+        "http://go_scraper_2:8080",
+        "http://go_scraper_3:8080",
+        "http://go_scraper_4:8080",
+    ]
+    
+    logger.info("progress_tracker.started", job_id=job_id)
+    
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http_client:
+            # Query all instances for jobs
+            total_scraped = 0
+            active_jobs = []
+            
+            for instance in instances:
+                try:
+                    # Get list of jobs
+                    resp = await http_client.get(f"{instance}/api/v1/jobs")
+                    if resp.status_code == 200:
+                        jobs = resp.json()
+                        
+                        for job in jobs:
+                            status = job.get("Status") or job.get("status", "")
+                            job_id_str = job.get("ID") or job.get("id", "")
+                            
+                            # Only count WORKING jobs (not completed "ok" jobs from previous runs)
+                            if status == "working":
+                                active_jobs.append(job)
+                                
+                                # Download CSV to count results
+                                try:
+                                    csv_resp = await http_client.get(
+                                        f"{instance}/api/v1/jobs/{job_id_str}/download",
+                                        timeout=5
+                                    )
+                                    if csv_resp.status_code == 200:
+                                        csv_text = csv_resp.text
+                                        if csv_text and csv_text.strip():
+                                            # Count rows (excluding header)
+                                            reader = csv.reader(io.StringIO(csv_text))
+                                            row_count = sum(1 for _ in reader) - 1  # Subtract header
+                                            if row_count > 0:
+                                                total_scraped += row_count
+                                                logger.debug(
+                                                    "progress_tracker.job_counted",
+                                                    instance=instance,
+                                                    job_id=job_id_str[:8],
+                                                    status=status,
+                                                    count=row_count
+                                                )
+                                except Exception as csv_err:
+                                    # CSV download might fail if job just started
+                                    logger.debug(
+                                        "progress_tracker.csv_download_failed",
+                                        instance=instance,
+                                        job_id=job_id_str[:8],
+                                        error=str(csv_err)[:100]
+                                    )
+                except Exception as e:
+                    logger.debug("progress_tracker.instance_query_failed", instance=instance, error=str(e))
+            
+            if total_scraped > 0:
+                # Calculate progress: 5% (start) + (scraped/max_results * 30%)
+                # Scale to 5-35% range (scraping phase)
+                progress_pct = min(5 + int((total_scraped / max_results) * 30), 35)
+                
+                # Calculate ETA
+                elapsed = time.time() - start_time
+                eta = format_eta(elapsed, progress_pct, 100)
+                
+                # Create a FRESH database session for thread-safe updates
+                fresh_db = SessionLocal()
+                try:
+                    # Update database
+                    job = fresh_db.query(ScrapeJob).filter(ScrapeJob.id == job_uuid).first()
+                    if job and job.status == "RUNNING":
+                        stats = job.statistics or {}
+                        stats["progress_percentage"] = progress_pct
+                        stats["progress_message"] = f"🌐 Scraping hotels... ({total_scraped} found so far)"
+                        stats["records_so_far"] = total_scraped
+                        stats["estimated_time_remaining"] = eta
+                        stats["raw_scraped"] = total_scraped  # Update raw count
+                        job.statistics = stats
+                        fresh_db.commit()
+                        
+                        logger.info(
+                            "progress_tracker.updated",
+                            job_id=job_id,
+                            scraped=total_scraped,
+                            progress=progress_pct,
+                            active_jobs=len(active_jobs)
+                        )
+                        return True
+                finally:
+                    fresh_db.close()
+            else:
+                # Fallback: If we can't get count from API, check if jobs are actively running
+                # If jobs exist and are working, keep the current progress message
+                if len(active_jobs) > 0:
+                    fresh_db = SessionLocal()
+                    try:
+                        job = fresh_db.query(ScrapeJob).filter(ScrapeJob.id == job_uuid).first()
+                        if job and job.status == "RUNNING":
+                            stats = job.statistics or {}
+                            current_progress = stats.get("progress_percentage", 5)
+                            
+                            # Don't update if we're already past scraping phase (>35%)
+                            if current_progress < 35:
+                                # Keep current message, just update that we're still working
+                                logger.debug(
+                                    "progress_tracker.no_count_but_jobs_active",
+                                    job_id=job_id,
+                                    active_jobs=len(active_jobs),
+                                    current_progress=current_progress
+                                )
+                    finally:
+                        fresh_db.close()
+            
+    except Exception as e:
+        logger.warning("progress_tracker.failed", job_id=job_id, error=str(e))
+    
+    return False
+
+
 def real_scrape_task_impl(job_id: str):
     """
     Real scraper task implementation for Phase 2.
@@ -237,18 +420,136 @@ def real_scrape_task_impl(job_id: str):
             logger.error("job.not_found", job_id=job_id)
             return
         
-        # Set status to RUNNING
+        # Set status to RUNNING with initial progress
         job.status = "RUNNING"
         job.started_at = datetime.utcnow()
+        start_time = time.time()
+        
+        # Initialize progress tracking
+        stats = {
+            "raw_scraped": 0,
+            "by_source": {},
+            "by_source_name": {},
+            "new_records": 0,
+            "duplicates": 0,
+            "updated_records": 0,
+            "progress_percentage": 0,
+            "progress_message": "🔍 Starting scrape job..."
+        }
+        job.statistics = stats
         db.commit()
         logger.info("job.started", job_id=job_id, location=job.location, category_id=job.category_id)
         
-        # Run orchestrator (async) with timeout handling
+        # Run orchestrator (async) with timeout handling and real-time progress tracking
         try:
+            # Update progress: Scraping phase started
+            # Get category name for progress message
+            from models import Category
+            category = db.query(Category).filter(Category.id == job.category_id).first()
+            category_name = category.name if category else "results"
+            
+            stats["progress_percentage"] = 5
+            stats["progress_message"] = f"🌐 Scraping {category_name} in {job.location}..."
+            job.statistics = stats
+            db.commit()
+            
+            # Create a background task for orchestrator
             orchestrator = ScraperOrchestrator()
-            raw_results, failed_source_ids = asyncio.run(
-                orchestrator.run_async(db, str(job_uuid))
-            )
+            
+            # Run orchestrator with periodic progress updates based on phase
+            async def run_with_progress_tracking():
+                """Run orchestrator while showing phase-based progress."""
+                logger.info("progress_tracker.starting", job_id=job_id)
+                
+                # Start orchestrator as a task
+                orchestrator_task = asyncio.create_task(
+                    orchestrator.run_async(db, str(job_uuid))
+                )
+                
+                logger.info("progress_tracker.orchestrator_task_created", job_id=job_id, task_done=orchestrator_task.done())
+                
+                # Progress tracking variables
+                progress_poll_interval = 3  # seconds
+                poll_count = 0
+                
+                # Phase-based progress messages
+                phase_messages = [
+                    (0, 10, "🔍 Searching Google Maps..."),
+                    (10, 20, "🔍 Exploring search area..."),
+                    (20, 30, "📍 Finding locations..."),
+                    (30, 35, "🔍 Completing search..."),
+                ]
+                
+                while not orchestrator_task.done():
+                    await asyncio.sleep(progress_poll_interval)
+                    poll_count += 1
+                    
+                    logger.debug("progress_tracker.poll_iteration", job_id=job_id, poll_count=poll_count, task_done=orchestrator_task.done())
+                    
+                    try:
+                        # Determine phase based on elapsed time
+                        # Typical scraping takes 2-5 minutes, spread progress across that
+                        elapsed = time.time() - start_time
+                        elapsed_minutes = elapsed / 60
+                        
+                        # Progress grows smoothly: 5% + (time-based growth to 35%)
+                        # Assume scraping takes ~4 minutes on average
+                        progress_pct = min(5 + int((elapsed_minutes / 4) * 30), 35)
+                        
+                        # Select message based on progress
+                        message = phase_messages[0][2]  # default
+                        for start, end, msg in phase_messages:
+                            if start <= progress_pct < end:
+                                message = msg
+                                break
+                        
+                        # Update database
+                        progress_db = SessionLocal()
+                        try:
+                            progress_job = progress_db.query(ScrapeJob).filter(ScrapeJob.id == job_uuid).first()
+                            if progress_job and progress_job.status == "RUNNING":
+                                # Get category name
+                                from models import Category
+                                category = progress_db.query(Category).filter(Category.id == progress_job.category_id).first()
+                                category_name = category.name if category else "results"
+                                
+                                stats = progress_job.statistics or {}
+                                stats["progress_percentage"] = progress_pct
+                                stats["progress_message"] = f"{message} ({category_name} in {progress_job.location})"
+                                progress_job.statistics = stats
+                                
+                                # Force JSONB update by marking as modified
+                                from sqlalchemy.orm.attributes import flag_modified
+                                flag_modified(progress_job, "statistics")
+                                
+                                progress_db.commit()
+                                progress_db.refresh(progress_job)
+                                
+                                logger.info(
+                                    "progress_update.phase_based",
+                                    job_id=job_id,
+                                    progress=progress_pct,
+                                    message=message,
+                                    elapsed_minutes=round(elapsed_minutes, 2),
+                                    db_committed=True
+                                )
+                            else:
+                                logger.warning("progress_update.job_not_found_or_not_running", job_id=job_id)
+                        except Exception as db_err:
+                            logger.error("progress_update.db_error", job_id=job_id, error=str(db_err), exc_info=True)
+                        finally:
+                            progress_db.close()
+                                
+                    except Exception as progress_err:
+                        logger.warning("progress_update_error", job_id=job_id, error=str(progress_err))
+                
+                logger.info("progress_tracker.loop_ended", job_id=job_id, poll_count=poll_count)
+                
+                # Get orchestrator result
+                return await orchestrator_task
+            
+            # Run orchestrator with progress tracking
+            raw_results, failed_source_ids = asyncio.run(run_with_progress_tracking())
         except SoftTimeLimitExceeded:
             logger.error("job.timeout", job_id=job_id, message="Task exceeded soft time limit")
             job.status = "FAILED"
@@ -271,18 +572,11 @@ def real_scrape_task_impl(job_id: str):
             failed_sources=len(failed_source_ids)
         )
         
-        # Track statistics for notification
-        stats = {
-            "raw_scraped": len(raw_results),
-            "by_source": {},
-            "by_source_name": {},  # Add source names for display
-            "new_records": 0,
-            "duplicates": 0,
-            "updated_records": 0,
-            "progress_message": f"✅ Scraping complete - {len(raw_results)} hotels found"
-        }
-        
-        # Update progress message immediately
+        # Update progress: Scraping complete
+        elapsed = time.time() - start_time
+        stats["raw_scraped"] = len(raw_results)
+        stats["progress_percentage"] = 35
+        stats["progress_message"] = f"✅ Search complete - found {len(raw_results)} results"
         job.statistics = stats
         db.commit()
         
@@ -306,6 +600,12 @@ def real_scrape_task_impl(job_id: str):
             stats["by_source_name"][source_name] = stats["by_source_name"].get(source_name, 0) + 1
         
         # Run cleaning pipeline for each source's results
+        # Update progress: Starting cleaning
+        stats["progress_percentage"] = 40
+        stats["progress_message"] = "🧹 Cleaning and validating data..."
+        job.statistics = stats
+        db.commit()
+        
         total_cleaned = 0
         total_updated = 0
         
@@ -329,13 +629,14 @@ def real_scrape_task_impl(job_id: str):
             total_cleaned += len(cleaned_results)
             total_updated += updated_count
             
-            # Track deduplication stats
-            # The difference between source_results and cleaned_results is duplicates
-            duplicates_for_source = len(source_results) - len(cleaned_results)
-            stats["duplicates"] += duplicates_for_source
+            # Count new vs duplicate records based on flags (not difference)
+            # Now that we save duplicates for visibility, we need to count by flags
+            new_count = sum(1 for r in cleaned_results if r.get("is_new_record", True))
+            duplicate_count = sum(1 for r in cleaned_results if not r.get("is_new_record", True) and not r.get("is_updated_record", False))
+            stats["duplicates"] += duplicate_count
+            stats["new_records"] += new_count
         
-        # Calculate new records (cleaned results that weren't duplicates)
-        stats["new_records"] = total_cleaned
+        # Updated records already tracked
         stats["updated_records"] = total_updated
         
         logger.info(
@@ -346,7 +647,8 @@ def real_scrape_task_impl(job_id: str):
         )
         
         # Update progress message after cleaning
-        stats["progress_message"] = f"✅ Cleaning complete - {stats['new_records']} new, {stats['duplicates']} duplicates, {stats['updated_records']} updated"
+        stats["progress_percentage"] = 60
+        stats["progress_message"] = f"✅ Validation complete - {stats['new_records']} new, {stats['duplicates']} duplicates, {stats['updated_records']} updated"
         job.statistics = stats
         db.commit()
         
@@ -354,6 +656,7 @@ def real_scrape_task_impl(job_id: str):
         if total_cleaned > 0:
             try:
                 # Update progress before merging
+                stats["progress_percentage"] = 70
                 stats["progress_message"] = "🔄 Merging data from multiple sources..."
                 job.statistics = stats
                 db.commit()
@@ -368,6 +671,7 @@ def real_scrape_task_impl(job_id: str):
                 )
                 
                 # Update progress after merging
+                stats["progress_percentage"] = 80
                 stats["progress_message"] = f"✅ Merging complete - {merge_stats['merged_groups']} groups merged"
                 job.statistics = stats
                 db.commit()
@@ -384,6 +688,7 @@ def real_scrape_task_impl(job_id: str):
         if settings.GEOCODING_ENABLED and total_cleaned > 0:
             try:
                 # Update progress before geocoding
+                stats["progress_percentage"] = 85
                 stats["progress_message"] = "📍 Adding location coordinates..."
                 job.statistics = stats
                 db.commit()
@@ -398,6 +703,7 @@ def real_scrape_task_impl(job_id: str):
                 )
                 
                 # Update progress after geocoding
+                stats["progress_percentage"] = 95
                 stats["progress_message"] = f"✅ Geocoding complete - {geocoded_count} locations added"
                 job.statistics = stats
                 db.commit()
@@ -411,6 +717,8 @@ def real_scrape_task_impl(job_id: str):
                 )
         
         # Update job with results and statistics
+        stats["progress_percentage"] = 100
+        stats["progress_message"] = "✨ Job complete!"
         job.status = "DONE"
         job.completed_at = datetime.utcnow()
         job.failed_source_ids = failed_source_ids if failed_source_ids else None

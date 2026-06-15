@@ -87,12 +87,12 @@ class CleaningPipeline:
         # Step 4: Cross-job deduplication (returns non-duplicates and update count)
         flagged, updated_count = self._dedup_cross_job(deduplicated, category_id, job_id)
         
-        # Filter out duplicates - they were already updated in _dedup_cross_job
-        # Only new records should be saved to cleaned_results table
-        non_duplicates = [r for r in flagged if not r.get("is_duplicate", False)]
+        # All records from flagged should be saved now (including duplicates for visibility)
+        # The is_duplicate, is_new_record, is_updated_record flags are already set
+        records_to_save = flagged
         
         # Step 5: Validate
-        validated = [self._validate(r) for r in non_duplicates]
+        validated = [self._validate(r) for r in records_to_save]
         
         # Step 6: Compute completeness
         scored = [self._compute_completeness(r) for r in validated]
@@ -260,6 +260,14 @@ class CleaningPipeline:
         2. New value is different from existing
         3. Field is not manually edited (is_edited=False)
         
+        Also sets tracking flags:
+        - is_new_record=True for new records
+        - is_updated_record=True for existing records that were updated
+        
+        SKIP EXISTING LOGIC:
+        If job.skip_existing=True, check if record exists BEFORE processing.
+        Skip entirely using place_id or phone+name match. This is a pre-flight check.
+        
         Args:
             results: List of deduplicated result dictionaries
             category_id: ID of the category
@@ -284,13 +292,22 @@ class CleaningPipeline:
             'includes_taxes', 'established_year', 'extra_data'
         ]
         
+        # Import ScrapeJob to check skip_existing flag
+        from models.scrape_job import ScrapeJob
+        
+        # Get the job to check skip_existing flag
+        job = self.db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+        skip_existing = job.skip_existing if job else False
+        
         duplicate_count = 0
         updated_count = 0
+        skipped_count = 0
         non_duplicates = []
         
         for result in results:
             dedup_key = result.get("dedup_key")
             
+            # UNIFIED CHECK: Query for existing record once
             if dedup_key:
                 # Query for existing record with same dedup_key and category_id
                 existing = self.db.query(CleanedResult).filter(
@@ -298,7 +315,29 @@ class CleaningPipeline:
                     CleanedResult.category_id == category_id
                 ).first()
                 
-                if existing:
+                # If skip_existing=True and record exists, save as duplicate reference
+                if skip_existing and existing:
+                    logger.info(
+                        "dedup.skip_existing",
+                        job_id=job_id,
+                        name=result.get('name'),
+                        dedup_key_prefix=dedup_key[:16],
+                        reason="skip_existing enabled"
+                    )
+                    skipped_count += 1
+                    duplicate_count += 1
+                    
+                    # Save duplicate record so it appears in filters
+                    # Mark with flags so user can see it was a duplicate/skipped
+                    result["is_duplicate"] = True
+                    result["is_new_record"] = False
+                    result["is_updated_record"] = False
+                    result["duplicate_of_id"] = str(existing.id)  # Reference to original
+                    non_duplicates.append(result)
+                    continue  # Skip update logic but save duplicate for visibility
+                
+                # NORMAL DEDUPLICATION: If skip_existing=False OR record is new, process normally
+                if existing and not skip_existing:
                     # SMART MERGE: Update existing record with new data
                     updated_fields = []
                     
@@ -334,6 +373,9 @@ class CleaningPipeline:
                             # Update metadata
                             existing.updated_at = datetime.utcnow()
                             existing.scraper_source = result.get('scraper_source', existing.scraper_source)
+                            
+                            # Set tracking flag for updated records
+                            existing.is_updated_record = True
                             
                             # Track which sources contributed to this merged record
                             source_id = result.get('source_id')
@@ -374,11 +416,15 @@ class CleaningPipeline:
                     # New record - not a duplicate
                     if not result.get("is_duplicate", False):
                         result["is_duplicate"] = False
+                        result["is_new_record"] = True  # Mark as new record
+                        result["is_updated_record"] = False
                     non_duplicates.append(result)
             else:
                 # No dedup key - keep as non-duplicate
                 if not result.get("is_duplicate", False):
                     result["is_duplicate"] = False
+                    result["is_new_record"] = True  # Mark as new record
+                    result["is_updated_record"] = False
                 non_duplicates.append(result)
         
         # Commit updates to existing records
@@ -391,7 +437,8 @@ class CleaningPipeline:
             total_input=len(results),
             duplicates_found=duplicate_count,
             records_updated=updated_count,
-            new_records=len(non_duplicates)
+            new_records=len(non_duplicates),
+            skipped_by_flag=skipped_count if skip_existing else 0
         )
         
         # Return non-duplicate results and update count
@@ -602,6 +649,10 @@ class CleaningPipeline:
                 # Go scraper integration
                 scraper_source=result.get("scraper_source"),
                 extra_data=result.get("extra_data") or None,
+                
+                # Phase 1 tracking flags
+                is_new_record=result.get("is_new_record", True),
+                is_updated_record=result.get("is_updated_record", False),
             )
             
             self.db.add(cleaned_record)

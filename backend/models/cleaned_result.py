@@ -111,3 +111,7 @@ class CleanedResult(Base):
     # Stores temporary edits separately from permanent ones
     # Format: {"field_name": {"value": "new_value", "temp": true, "edited_by": 1, "edited_at": "2026-05-25T13:00:00"}}
     user_overrides = Column(JSONB, nullable=True)
+
+    # Phase 1 — record tracking for filters
+    is_new_record = Column(Boolean, nullable=True, default=True)
+    is_updated_record = Column(Boolean, nullable=True, default=False)

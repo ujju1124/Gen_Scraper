@@ -39,7 +39,12 @@ class ScraperOrchestrator:
         """Initialize the orchestrator."""
         self.delay_between_requests = 2.0  # seconds
     
-    async def run_async(self, db: Session, job_id: str) -> Tuple[list[dict], list[int]]:
+    async def run_async(
+        self,
+        db: Session,
+        job_id: str,
+        progress_callback: Optional[callable] = None
+    ) -> Tuple[list[dict], list[int]]:
         """
         Main entry point for orchestrator.
         
@@ -49,6 +54,8 @@ class ScraperOrchestrator:
         Args:
             db: SQLAlchemy database session
             job_id: UUID of the scrape job (string or UUID object)
+            progress_callback: Optional async function to call with progress updates
+                             Signature: async def callback(current: int, total: int, message: str)
             
         Returns:
             Tuple of (results, failed_source_ids)
@@ -59,6 +66,7 @@ class ScraperOrchestrator:
             >>> orchestrator = ScraperOrchestrator()
             >>> results, failed_ids = await orchestrator.run_async(db, job_id)
         """
+        self.progress_callback = progress_callback
         results = []
         failed_source_ids = []
         

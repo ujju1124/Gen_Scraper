@@ -168,6 +168,9 @@ ALL_*.md
 # Archive folder
 archive/
 
+# Data backup folder
+DATA_BACKUP/
+
 # Temporary credentials and test files
 NEW_ADMIN_CREDENTIALS.txt
 TEST_LOGIN.txt

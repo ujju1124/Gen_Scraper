@@ -12,6 +12,17 @@ export default defineConfig({
         changeOrigin: true,
         secure: false,
         cookieDomainRewrite: 'localhost',
+        // Enable SSE support
+        configure: (proxy, _options) => {
+          proxy.on('proxyReq', (proxyReq, req, _res) => {
+            // For SSE endpoints, set appropriate headers
+            if (req.url.includes('/stream')) {
+              proxyReq.setHeader('Accept', 'text/event-stream')
+              proxyReq.setHeader('Cache-Control', 'no-cache')
+              proxyReq.setHeader('Connection', 'keep-alive')
+            }
+          })
+        }
       }
     }
   },
